@@ -97,7 +97,7 @@ async function getUserInfo(userId) {
     const requestParams = {
       auth: client,
       spreadsheetId,
-      range: "Teams!A2:D1000"
+      range: "Teams!A2:E1000"  // Extended to include Role column
     };
     
     const result = await sheets.spreadsheets.values.get(requestParams);
@@ -118,7 +118,8 @@ async function getUserInfo(userId) {
       name: row[0],      // Team member name
       userId: row[1],    // Slack ID
       team: row[2],      // Team name
-      managerId: row[3]  // Manager's Slack ID
+      managerId: row[3], // Manager's Slack ID
+      role: row[4] || 'Employee'  // Role (default to Employee if not set)
     };
     
     log.info("User info retrieved successfully", { userId, userInfo });
@@ -132,6 +133,401 @@ async function getUserInfo(userId) {
     });
     throw error;
   }
+}
+
+async function checkReportAccess(requesterId, scope = 'self') {
+  const requesterInfo = await getUserInfo(requesterId);
+  
+  if (!requesterInfo) {
+    return { allowed: false, reason: 'User not found in system' };
+  }
+  
+  // Admin can see everything
+  if (requesterInfo.role === 'Admin') {
+    return { allowed: true, level: 'all', requesterInfo };
+  }
+  
+  // Manager can see self and direct reports
+  if (requesterInfo.role === 'Manager') {
+    if (scope === 'self' || scope === 'team') {
+      return { allowed: true, level: 'team', requesterInfo };
+    }
+    if (scope === 'all') {
+      return { allowed: false, reason: 'Managers can only view their team data' };
+    }
+  }
+  
+  // Employee can only see self
+  if (requesterInfo.role === 'Employee') {
+    if (scope === 'self') {
+      return { allowed: true, level: 'self', requesterInfo };
+    }
+    return { allowed: false, reason: 'Employees can only view their own data' };
+  }
+  
+  return { allowed: false, reason: 'Invalid role' };
+}
+
+async function getTeamMembers(managerId) {
+  log.info("Getting team members for manager", { managerId });
+  
+  try {
+    const client = await auth.getClient();
+    const result = await sheets.spreadsheets.values.get({
+      auth: client,
+      spreadsheetId,
+      range: "Teams!A2:E1000"
+    });
+    
+    const rows = result.data.values || [];
+    const teamMembers = rows
+      .filter(r => r[3] === managerId)  // Manager ID is in column D
+      .map(r => ({
+        name: r[0],
+        userId: r[1],
+        team: r[2],
+        role: r[4] || 'Employee'
+      }));
+    
+    log.info("Team members retrieved", { 
+      managerId, 
+      teamCount: teamMembers.length 
+    });
+    
+    return teamMembers;
+  } catch (error) {
+    log.error("Failed to get team members", {
+      managerId,
+      error: error.message
+    });
+    return [];
+  }
+}
+
+async function getAllRequests(filterUserId = null, filterStatus = null) {
+  log.info("Getting requests from Google Sheets", { filterUserId, filterStatus });
+  
+  try {
+    const client = await auth.getClient();
+    const result = await sheets.spreadsheets.values.get({
+      auth: client,
+      spreadsheetId,
+      range: "Requests!A2:G1000"
+    });
+    
+    let requests = result.data.values || [];
+    
+    // Parse into objects
+    requests = requests.map(r => ({
+      timestamp: r[0],
+      userId: r[1],
+      start: r[2],
+      end: r[3],
+      reason: r[4],
+      status: r[5],
+      managerId: r[6]
+    }));
+    
+    // Apply filters
+    if (filterUserId) {
+      if (Array.isArray(filterUserId)) {
+        requests = requests.filter(r => filterUserId.includes(r.userId));
+      } else {
+        requests = requests.filter(r => r.userId === filterUserId);
+      }
+    }
+    
+    if (filterStatus) {
+      requests = requests.filter(r => r.status === filterStatus);
+    }
+    
+    log.info("Requests retrieved", { 
+      totalCount: requests.length,
+      filtered: !!filterUserId || !!filterStatus
+    });
+    
+    return requests;
+  } catch (error) {
+    log.error("Failed to get requests", {
+      error: error.message
+    });
+    return [];
+  }
+}
+
+async function generateReport(userId, reportType, params = {}) {
+  log.info("Generating report", { userId, reportType, params });
+  
+  const access = await checkReportAccess(userId, params.scope || 'self');
+  
+  if (!access.allowed) {
+    return {
+      success: false,
+      message: `❌ Access Denied: ${access.reason}`
+    };
+  }
+  
+  const userInfo = access.requesterInfo;
+  let reportData = {};
+  
+  switch (reportType) {
+    case 'balance':
+      if (access.level === 'all') {
+        // Admin: get all balances
+        const allUsers = await getAllUsers();
+        const balances = await Promise.all(
+          allUsers.map(async (u) => ({
+            ...u,
+            balance: await getBalance(u.userId)
+          }))
+        );
+        reportData = { type: 'all_balances', data: balances };
+      } else if (access.level === 'team') {
+        // Manager: get team balances
+        const teamMembers = await getTeamMembers(userId);
+        const balances = await Promise.all(
+          teamMembers.map(async (u) => ({
+            ...u,
+            balance: await getBalance(u.userId)
+          }))
+        );
+        // Include manager's own balance
+        balances.unshift({
+          ...userInfo,
+          balance: await getBalance(userId)
+        });
+        reportData = { type: 'team_balances', data: balances };
+      } else {
+        // Employee: get own balance
+        const balance = await getBalance(userId);
+        reportData = { type: 'personal_balance', data: { ...userInfo, balance } };
+      }
+      break;
+      
+    case 'requests':
+      if (access.level === 'all') {
+        // Admin: get all requests
+        const requests = await getAllRequests(null, params.status);
+        reportData = { type: 'all_requests', data: requests };
+      } else if (access.level === 'team') {
+        // Manager: get team requests
+        const teamMembers = await getTeamMembers(userId);
+        const teamIds = [userId, ...teamMembers.map(m => m.userId)];
+        const requests = await getAllRequests(teamIds, params.status);
+        reportData = { type: 'team_requests', data: requests };
+      } else {
+        // Employee: get own requests
+        const requests = await getAllRequests(userId, params.status);
+        reportData = { type: 'personal_requests', data: requests };
+      }
+      break;
+      
+    case 'upcoming':
+      const today = new Date();
+      const endDate = new Date();
+      endDate.setDate(today.getDate() + (params.days || 7));
+      
+      let requests;
+      if (access.level === 'all') {
+        requests = await getAllRequests(null, 'approved');
+      } else if (access.level === 'team') {
+        const teamMembers = await getTeamMembers(userId);
+        const teamIds = [userId, ...teamMembers.map(m => m.userId)];
+        requests = await getAllRequests(teamIds, 'approved');
+      } else {
+        requests = await getAllRequests(userId, 'approved');
+      }
+      
+      // Filter to upcoming dates
+      const upcoming = requests.filter(r => {
+        const start = new Date(r.start);
+        const end = new Date(r.end);
+        return (start <= endDate && end >= today);
+      });
+      
+      reportData = { type: 'upcoming_pto', data: upcoming };
+      break;
+  }
+  
+  return {
+    success: true,
+    access: access.level,
+    reportData
+  };
+}
+
+async function getAllUsers() {
+  log.info("Getting all users from Teams sheet");
+  
+  try {
+    const client = await auth.getClient();
+    const result = await sheets.spreadsheets.values.get({
+      auth: client,
+      spreadsheetId,
+      range: "Teams!A2:E1000"
+    });
+    
+    const rows = result.data.values || [];
+    const users = rows.map(r => ({
+      name: r[0],
+      userId: r[1],
+      team: r[2],
+      managerId: r[3],
+      role: r[4] || 'Employee'
+    }));
+    
+    log.info("All users retrieved", { userCount: users.length });
+    return users;
+  } catch (error) {
+    log.error("Failed to get all users", { error: error.message });
+    return [];
+  }
+}
+
+async function parseReportQuery(text) {
+  log.info("Parsing report query with OpenRouter", { inputText: text });
+  
+  const prompt = `Extract report request info from: "${text}". 
+Identify the report type and parameters.
+Types: balance, requests, upcoming, summary
+Scope: self, team, all
+Status: pending, approved, denied, all
+
+Return JSON like:
+{
+  "type": "balance|requests|upcoming|summary",
+  "scope": "self|team|all",
+  "status": "pending|approved|denied|all",
+  "days": 7,
+  "format": "simple|detailed"
+}
+
+Examples:
+"my balance" -> {"type":"balance","scope":"self"}
+"team requests" -> {"type":"requests","scope":"team","status":"all"}
+"pending approvals" -> {"type":"requests","scope":"team","status":"pending"}
+"who's out next week" -> {"type":"upcoming","scope":"team","days":7}
+"all employee balances" -> {"type":"balance","scope":"all"}`;
+  
+  const requestBody = {
+    model: "openai/gpt-3.5-turbo",
+    messages: [{ role: "user", content: prompt }]
+  };
+  
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    const data = await res.json();
+    const parsed = JSON.parse(data.choices[0].message.content.trim());
+    
+    log.info("Report query parsed successfully", { parsed });
+    return parsed;
+  } catch (error) {
+    log.error("Failed to parse report query", { error: error.message });
+    // Default fallback
+    return {
+      type: 'balance',
+      scope: 'self',
+      status: 'all',
+      format: 'simple'
+    };
+  }
+}
+
+async function formatReportWithLLM(reportData, format = 'simple') {
+  log.info("Formatting report with LLM", { 
+    reportType: reportData.type,
+    dataCount: reportData.data?.length || 1
+  });
+  
+  let prompt = `Format this PTO data into a clear, readable Slack message with appropriate emojis and formatting.\n\nData: ${JSON.stringify(reportData)}\n\n`;
+  
+  if (format === 'simple') {
+    prompt += "Keep it concise with key information only. Use bullet points and bold for emphasis.";
+  } else {
+    prompt += "Provide a detailed report with insights and summaries. Include totals and patterns if relevant.";
+  }
+  
+  const requestBody = {
+    model: "openai/gpt-3.5-turbo",
+    messages: [{ role: "user", content: prompt }]
+  };
+  
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    const data = await res.json();
+    return data.choices[0].message.content.trim();
+  } catch (error) {
+    log.error("Failed to format report with LLM", { error: error.message });
+    // Fallback to simple formatting
+    return formatReportFallback(reportData);
+  }
+}
+
+function formatReportFallback(reportData) {
+  let message = "📊 *PTO Report*\n\n";
+  
+  switch (reportData.type) {
+    case 'personal_balance':
+      const b = reportData.data.balance;
+      message += `*Your PTO Balance:*\n`;
+      message += `• Annual allowance: ${b.allowance} days\n`;
+      message += `• Used: ${b.taken} days\n`;
+      message += `• Remaining: ${b.remaining} days\n`;
+      break;
+      
+    case 'team_balances':
+    case 'all_balances':
+      message += `*PTO Balances:*\n`;
+      reportData.data.forEach(user => {
+        message += `\n*${user.name}* (${user.team})\n`;
+        message += `• Remaining: ${user.balance.remaining}/${user.balance.allowance} days\n`;
+      });
+      break;
+      
+    case 'personal_requests':
+    case 'team_requests':
+    case 'all_requests':
+      message += `*PTO Requests:*\n`;
+      if (reportData.data.length === 0) {
+        message += "No requests found.\n";
+      } else {
+        reportData.data.forEach(req => {
+          message += `\n• ${req.start} to ${req.end}\n`;
+          message += `  User: <@${req.userId}> | Status: ${req.status}\n`;
+        });
+      }
+      break;
+      
+    case 'upcoming_pto':
+      message += `*Upcoming PTO:*\n`;
+      if (reportData.data.length === 0) {
+        message += "No one is scheduled out.\n";
+      } else {
+        reportData.data.forEach(req => {
+          message += `\n• <@${req.userId}>: ${req.start} to ${req.end}\n`;
+          message += `  Reason: ${req.reason}\n`;
+        });
+      }
+      break;
+  }
+  
+  return message;
 }
 
 async function getBalance(userId) {
@@ -881,19 +1277,77 @@ export default async function handler(req, res) {
       }
       
       // Handle slash commands
-      if (body.command === "/pto") {
-        log.info("Processing /pto command directly");
+      if (body.command === "/pto" || body.command === "/pto-report") {
+        log.info(`Processing ${body.command} command directly`);
         
-        // Create the context object that Bolt expects
-        const context = {
-          ack: async () => {
-            log.debug("Command acknowledged");
-            return Promise.resolve();
-          },
-          body: body,
-          client: app.client,
-          command: body
-        };
+        if (body.command === "/pto-report") {
+          // Handle report command
+          const userId = body.user_id;
+          const queryText = body.text || "my balance";
+          
+          log.info("PTO report command received", {
+            userId,
+            userName: body.user_name,
+            queryText
+          });
+          
+          try {
+            // Parse the report query
+            const query = await parseReportQuery(queryText);
+            log.info("Report query parsed", { userId, query });
+            
+            // Generate the report
+            const report = await generateReport(userId, query.type, query);
+            
+            if (!report.success) {
+              await app.client.chat.postMessage({
+                channel: userId,
+                text: report.message
+              });
+              res.statusCode = 200;
+              res.end("");
+              return;
+            }
+            
+            // Format the report
+            const formattedReport = await formatReportWithLLM(
+              report.reportData,
+              query.format || 'simple'
+            );
+            
+            // Send the report
+            await app.client.chat.postMessage({
+              channel: userId,
+              text: formattedReport
+            });
+            
+            log.info("Report sent successfully", {
+              userId,
+              reportType: query.type,
+              accessLevel: report.access
+            });
+            
+          } catch (error) {
+            log.error("Error processing report command", {
+              userId,
+              queryText,
+              error: error.message,
+              stack: error.stack
+            });
+            
+            await app.client.chat.postMessage({
+              channel: userId,
+              text: "❌ Sorry, there was an error generating your report. Please try again."
+            });
+          }
+          
+          res.statusCode = 200;
+          res.end("");
+          return;
+        }
+        
+        // Original /pto command handling
+        if (body.command === "/pto") {
         
         // Get the registered command handler
         const commandHandlers = app._listeners?.slash_command || [];
