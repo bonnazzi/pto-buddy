@@ -1,24 +1,27 @@
-export const config = { api: { bodyParser: false } }; // ⭐️ Needed for Slack
+/* ---------- api/index.js ---------- */
+/* 1️⃣  Let Slack send the raw body (needed for signature verification) */
+export const config = { api: { bodyParser: false } };
 
-import pkg from "@slack/bolt";
-const { App } = pkg;
+/* 2️⃣  Imports — use the CommonJS-friendly pattern */
+import boltPkg from "@slack/bolt";
+const { App } = boltPkg;
 
-import googleapisPkg from "googleapis";
-const { google } = googleapisPkg;
+import gapiPkg from "googleapis";
+const { google } = gapiPkg;
 
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
-// 1️⃣  Slack app setup
+/* 3️⃣  Bolt app initialisation */
 const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
+  token: process.env.SLACK_BOT_TOKEN,          // xoxb-…
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: false,            // we’ll use HTTPS requests
-  appToken: process.env.APP_TOKEN // not used here but Bolt wants it
+  socketMode: false,
+  appToken: process.env.APP_TOKEN || "unused"  // any string if socketMode=false
 });
 
-// 2  Google Sheets auth
+/* 4️⃣  Google Sheets set-up */
 const sheets = google.sheets("v4");
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GCP_JSON),
@@ -26,23 +29,21 @@ const auth = new google.auth.GoogleAuth({
 });
 const spreadsheetId = process.env.SPREADSHEET_ID;
 
-// 3  Helper: read user balance
+/* Helpers */
 async function getBalance(userId) {
   const client = await auth.getClient();
-  const res = await sheets.spreadsheets.values.get({
+  const result = await sheets.spreadsheets.values.get({
     auth: client,
     spreadsheetId,
     range: "Balances!A2:C1000"
   });
-  const row = res.data.values?.find(r => r[0] === userId);
-  if (!row) return { remaining: 0, taken: 0, allowance: 0 };
-  const allowance = Number(row[1]);
-  const taken = Number(row[2]);
-  return { remaining: allowance - taken, taken, allowance };
+  const row = result.data.values?.find(r => r[0] === userId);
+  if (!row) return { allowance: 0, taken: 0, remaining: 0 };
+  const [ , allowance, taken ] = row.map(Number);
+  return { allowance, taken, remaining: allowance - taken };
 }
 
-// 4  Helper: append request
-async function logRequest({ user, start, end, reason, manager }) {
+async function logRequest(obj) {
   const client = await auth.getClient();
   await sheets.spreadsheets.values.append({
     auth: client,
@@ -50,14 +51,22 @@ async function logRequest({ user, start, end, reason, manager }) {
     range: "Requests!A2:G2",
     valueInputOption: "USER_ENTERED",
     requestBody: {
-      values: [[new Date().toISOString(), user, start, end, reason, "pending", manager]]
+      values: [[
+        new Date().toISOString(),
+        obj.user,
+        obj.start,
+        obj.end,
+        obj.reason,
+        "pending",
+        obj.manager
+      ]]
     }
   });
 }
 
-// 5  Helper: call LLM via OpenRouter
-async function parsePTO(text) {
-  const prompt = `Extract PTO info from: "${text}".\nReturn JSON like {"start":"YYYY-MM-DD","end":"YYYY-MM-DD","reason":"..."}.\nIf only one date, use it for both start and end.`;
+/* Very simple natural-language parser via OpenRouter */
+async function parsePto(text) {
+  const prompt = `Extract PTO info from: "${text}". Return JSON like {"start":"YYYY-MM-DD","end":"YYYY-MM-DD","reason":"..."} (if one date, use for both).`;
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -70,83 +79,75 @@ async function parsePTO(text) {
     })
   });
   const data = await res.json();
-  const content = JSON.parse(data.choices[0].message.content.trim());
-  return content;
+  return JSON.parse(data.choices[0].message.content.trim());
 }
 
-// 6  Slash command
-app.command("/leave", async ({ ack, body, client, say }) => {
+/* 5  /leave slash command */
+app.command("/leave", async ({ ack, body, client }) => {
   await ack();
   const userId = body.user_id;
-  const parsed = await parsePTO(body.text);
+  const parsed = await parsePto(body.text);
 
   const bal = await getBalance(userId);
   if (bal.remaining <= 0) {
-    await say(`<@${userId}> you’re out of PTO (used ${bal.taken}/${bal.allowance}).`);
+    await client.chat.postMessage({
+      channel: userId,
+      text: `You’re out of PTO (used ${bal.taken}/${bal.allowance}).`
+    });
     return;
   }
 
-  // Ask confirmation
   await client.chat.postMessage({
     channel: userId,
-    text: `You’re requesting ${parsed.start} → ${parsed.end} for *${parsed.reason}*. Type “yes” to confirm.`,
-    metadata: { event_type: "awaiting_confirmation", event_payload: parsed }
+    text: `Requesting ${parsed.start} → ${parsed.end} for *${parsed.reason}*.\nReply “yes” to confirm.`,
+    metadata: { event_type: "awaiting_confirmation", event_payload: { ...parsed } }
   });
 });
 
-// 7  Listen for “yes” confirmation in DM
-app.message(/^yes$/i, async ({ message, client, context }) => {
+/* 6️⃣  Confirmation listener */
+app.message(/^yes$/i, async ({ message, client }) => {
   if (!message.metadata || message.metadata.event_type !== "awaiting_confirmation") return;
   const { start, end, reason } = message.metadata.event_payload;
   const user = message.user;
-
-  // For simplicity, assume manager = HR admin’s Slack ID (env var)
   const manager = process.env.HR_SLACK_ID;
 
   await logRequest({ user, start, end, reason, manager });
 
-  // Send approval buttons
   await client.chat.postMessage({
     channel: manager,
     text: `PTO request from <@${user}>`,
     blocks: [
-      { type: "section", text: { type: "mrkdwn", text: `*PTO Request*\nUser: <@${user}>\n${start} → ${end}\nReason: ${reason}` } },
-      {
-        type: "actions",
-        block_id: "approval_block",
+      { type: "section",
+        text: { type: "mrkdwn", text: `*PTO Request*\nUser: <@${user}>\n${start} → ${end}\nReason: ${reason}` } },
+      { type: "actions",
         elements: [
-          { type: "button", text: { type: "plain_text", text: "Approve" }, style: "primary", value: JSON.stringify({ user, start, end }), action_id: "approve" },
-          { type: "button", text: { type: "plain_text", text: "Deny" }, style: "danger", value: JSON.stringify({ user }), action_id: "deny" }
-        ]
-      }
+          { type: "button", style: "primary", text: { type: "plain_text", text: "Approve" },
+            value: JSON.stringify({ user, start, end }), action_id: "approve" },
+          { type: "button", style: "danger", text: { type: "plain_text", text: "Deny" },
+            value: JSON.stringify({ user }), action_id: "deny" }
+        ] }
     ]
   });
 
-  await client.chat.postMessage({ channel: user, text: "Your request was sent for approval. 🎉" });
+  await client.chat.postMessage({ channel: user, text: "Request sent for approval. 🎉" });
 });
 
-// 8  Handle button clicks
-app.action("approve", async ({ body, ack, client }) => {
+/* 7️⃣  Approve / Deny buttons */
+app.action("approve", async ({ ack, body, client }) => {
   await ack();
   const { user, start, end } = JSON.parse(body.actions[0].value);
-  await client.chat.postMessage({ channel: user, text: `✅ Approved! Enjoy your time off from ${start} to ${end}` });
-  await client.chat.update({
-    channel: body.channel.id, ts: body.message.ts,
-    text: "Approved ✔️", blocks: []
-  });
+  await client.chat.postMessage({ channel: user, text: `✅ Approved! Enjoy ${start} → ${end}` });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: "Approved ✔️", blocks: [] });
 });
-app.action("deny", async ({ body, ack, client }) => {
+app.action("deny", async ({ ack, body, client }) => {
   await ack();
   const { user } = JSON.parse(body.actions[0].value);
   await client.chat.postMessage({ channel: user, text: `❌ Sorry, your PTO request was denied.` });
-  await client.chat.update({
-    channel: body.channel.id, ts: body.message.ts,
-    text: "Denied ✖️", blocks: []
-  });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: "Denied ✖️", blocks: [] });
 });
 
-// 9️⃣  Start Bolt (Vercel’s handler)
+/* 8️⃣  Export a Vercel handler */
 export default async function handler(req, res) {
-  await app.start();
+  await app.start();                    // spins up Bolt
   await app.receiver.requestListener(req, res);
 }
