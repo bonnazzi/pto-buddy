@@ -145,4 +145,7 @@ app.action("deny", async ({ ack, body, client }) => {
 });
 
 // --- Vercel Handler ---
-export default receiver.toHandler();
+export default function handler(req, res) {
+  receiver.app(req, res);
+}
+
