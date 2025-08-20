@@ -1348,6 +1348,9 @@ export default async function handler(req, res) {
         
         // Original /pto command handling
         if (body.command === "/pto") {
+          log.info("Executing PTO handler directly");
+          const userId = body.user_id;
+          const commandText = body.text;
         
         // Get the registered command handler
         const commandHandlers = app._listeners?.slash_command || [];
@@ -1357,7 +1360,6 @@ export default async function handler(req, res) {
           log.info("Found PTO handler, executing");
           await ptoHandler.listener(context);
         } else {
-          // Fallback: execute the handler directly
           log.info("Executing PTO handler directly");
           const userId = body.user_id;
           const commandText = body.text;
