@@ -435,30 +435,46 @@ export default function handler(req, res) {
     req.on("data", chunk => { body += chunk; });
     req.on("end", async () => {
       try {
-        const payload = JSON.parse(body);
-        log.debug("Request payload parsed", {
-          type: payload.type,
-          hasChallenge: !!payload.challenge
+        // Check content type to determine how to parse the body
+        const contentType = req.headers["content-type"] || "";
+        log.debug("Request content type", { contentType, bodyPreview: body.substring(0, 200) });
+        
+        // Check if it's JSON (for Slack events like url_verification)
+        if (contentType.includes("application/json")) {
+          const payload = JSON.parse(body);
+          log.debug("JSON payload parsed", {
+            type: payload.type,
+            hasChallenge: !!payload.challenge
+          });
+          
+          if (payload.type === "url_verification" && payload.challenge) {
+            log.info("Slack URL verification challenge received", {
+              challenge: payload.challenge
+            });
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "text/plain");
+            res.end(payload.challenge);
+            return;
+          }
+        }
+        
+        // For URL-encoded data (slash commands) or other Slack requests,
+        // pass directly to Bolt receiver without parsing
+        log.info("Passing request to Bolt receiver", {
+          contentType,
+          bodyLength: body.length,
+          isUrlEncoded: contentType.includes("application/x-www-form-urlencoded")
         });
         
-        if (payload.type === "url_verification" && payload.challenge) {
-          log.info("Slack URL verification challenge received", {
-            challenge: payload.challenge
-          });
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "text/plain");
-          res.end(payload.challenge);
-        } else {
-          log.info("Passing request to Bolt receiver", {
-            payloadType: payload.type
-          });
-          // Pass all other requests to Bolt
-          receiver.app(req, res);
-        }
+        // Reconstruct the request for Bolt
+        req.body = body;
+        receiver.app(req, res);
+        
       } catch (err) {
         log.error("Error processing request", {
           error: err.message,
           stack: err.stack,
+          contentType: req.headers["content-type"],
           body: body.substring(0, 500) // Log first 500 chars of body for debugging
         });
         res.statusCode = 400;
