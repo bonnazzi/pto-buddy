@@ -1,5 +1,3 @@
-// api/index.js
-
 export const config = { api: { bodyParser: false } };
 
 // --- Imports ---
