@@ -87,6 +87,53 @@ const spreadsheetId = process.env.SPREADSHEET_ID;
 log.info("Google Sheets setup complete", { spreadsheetId });
 
 // --- Helpers ---
+async function getUserInfo(userId) {
+  log.info("Getting user info from Teams tab", { userId, spreadsheetId });
+  
+  try {
+    const client = await auth.getClient();
+    log.debug("Google Auth client obtained for user info");
+    
+    const requestParams = {
+      auth: client,
+      spreadsheetId,
+      range: "Teams!A2:D1000"
+    };
+    
+    const result = await sheets.spreadsheets.values.get(requestParams);
+    log.info("Teams sheet response received", {
+      userId,
+      rowCount: result.data.values?.length || 0
+    });
+    
+    // ID is in column B (index 1)
+    const row = result.data.values?.find(r => r[1] === userId);
+    
+    if (!row) {
+      log.warn("User not found in Teams sheet", { userId });
+      return null;
+    }
+    
+    const userInfo = {
+      name: row[0],      // Team member name
+      userId: row[1],    // Slack ID
+      team: row[2],      // Team name
+      managerId: row[3]  // Manager's Slack ID
+    };
+    
+    log.info("User info retrieved successfully", { userId, userInfo });
+    return userInfo;
+    
+  } catch (error) {
+    log.error("Failed to get user info from Teams sheet", {
+      userId,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
 async function getBalance(userId) {
   log.info("Getting balance from Google Sheets", { userId, spreadsheetId });
   
@@ -170,6 +217,122 @@ async function logRequest(obj) {
   } catch (error) {
     log.error("Failed to log request to Google Sheets", {
       requestData: obj,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
+async function updateRequestStatus(userId, start, end, status) {
+  log.info("Updating request status in Google Sheets", { userId, start, end, status });
+  
+  try {
+    const client = await auth.getClient();
+    
+    // First, get all requests to find the matching one
+    const getResult = await sheets.spreadsheets.values.get({
+      auth: client,
+      spreadsheetId,
+      range: "Requests!A2:G1000"
+    });
+    
+    const rows = getResult.data.values || [];
+    const rowIndex = rows.findIndex(r => 
+      r[1] === userId && 
+      r[2] === start && 
+      r[3] === end && 
+      r[5] === "pending"
+    );
+    
+    if (rowIndex === -1) {
+      log.warn("No matching pending request found", { userId, start, end });
+      return;
+    }
+    
+    // Update the status column (F) for the found row
+    const updateRange = `Requests!F${rowIndex + 2}`; // +2 because we start from row 2
+    
+    await sheets.spreadsheets.values.update({
+      auth: client,
+      spreadsheetId,
+      range: updateRange,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [[status]]
+      }
+    });
+    
+    log.info("Request status updated successfully", { userId, status, range: updateRange });
+    
+    // If approved, update the balance
+    if (status === "approved") {
+      await updateBalance(userId, start, end);
+    }
+    
+  } catch (error) {
+    log.error("Failed to update request status", {
+      userId,
+      status,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
+async function updateBalance(userId, start, end) {
+  log.info("Updating user balance after approval", { userId, start, end });
+  
+  try {
+    const client = await auth.getClient();
+    
+    // Calculate days taken (simplified - you might want more complex logic)
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    const daysTaken = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+    
+    // Get current balance
+    const balanceResult = await sheets.spreadsheets.values.get({
+      auth: client,
+      spreadsheetId,
+      range: "Balances!A2:C1000"
+    });
+    
+    const rows = balanceResult.data.values || [];
+    const rowIndex = rows.findIndex(r => r[0] === userId);
+    
+    if (rowIndex === -1) {
+      log.warn("User not found in Balances sheet", { userId });
+      return;
+    }
+    
+    const currentTaken = Number(rows[rowIndex][2]) || 0;
+    const newTaken = currentTaken + daysTaken;
+    
+    // Update the taken_so_far column (C)
+    const updateRange = `Balances!C${rowIndex + 2}`;
+    
+    await sheets.spreadsheets.values.update({
+      auth: client,
+      spreadsheetId,
+      range: updateRange,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [[newTaken]]
+      }
+    });
+    
+    log.info("Balance updated successfully", { 
+      userId, 
+      daysTaken, 
+      previousBalance: currentTaken,
+      newBalance: newTaken 
+    });
+    
+  } catch (error) {
+    log.error("Failed to update balance", {
+      userId,
       error: error.message,
       stack: error.stack
     });
@@ -571,35 +734,128 @@ export default async function handler(req, res) {
           });
           
           try {
+            // Parse the PTO request
             const parsed = await parsePto(commandText);
             log.info("PTO text parsed successfully", { userId, parsed });
             
+            // Get user info from Teams sheet
+            const userInfo = await getUserInfo(userId);
+            if (!userInfo) {
+              log.error("User not found in Teams sheet", { userId });
+              await app.client.chat.postMessage({
+                channel: userId,
+                text: "❌ Sorry, I couldn't find your information in the system. Please contact HR to be added to the Teams sheet."
+              });
+              res.statusCode = 200;
+              res.end("");
+              return;
+            }
+            
+            // Get user's balance
             const bal = await getBalance(userId);
             log.info("User balance retrieved", { userId, balance: bal });
             
+            // Check if user has sufficient balance
             if (bal.remaining <= 0) {
               log.warn("User has insufficient PTO balance", { userId, balance: bal });
               
               await app.client.chat.postMessage({
                 channel: userId,
-                text: `You're out of PTO (used ${bal.taken}/${bal.allowance}).`
+                text: `❌ Sorry, you don't have enough PTO balance.\n\n*Your balance:*\n• Annual allowance: ${bal.allowance} days\n• Already taken: ${bal.taken} days\n• Remaining: ${bal.remaining} days`
               });
-              log.info("Insufficient balance message sent to user", { userId });
-            } else {
-              const confirmationMessage = {
-                channel: userId,
-                text: `Requesting ${parsed.start} → ${parsed.end} for *${parsed.reason}*.\nReply "yes" to confirm.`,
-                metadata: { event_type: "awaiting_confirmation", event_payload: { ...parsed } }
-              };
-              
-              log.debug("Sending confirmation message", confirmationMessage);
-              
-              await app.client.chat.postMessage(confirmationMessage);
-              log.info("Confirmation request sent to user", {
-                userId,
-                ptoRequest: parsed
-              });
+              res.statusCode = 200;
+              res.end("");
+              return;
             }
+            
+            // Calculate days requested
+            const startDate = new Date(parsed.start);
+            const endDate = new Date(parsed.end);
+            const daysRequested = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+            
+            if (daysRequested > bal.remaining) {
+              log.warn("User requesting more days than available", { 
+                userId, 
+                daysRequested, 
+                remaining: bal.remaining 
+              });
+              
+              await app.client.chat.postMessage({
+                channel: userId,
+                text: `❌ You're requesting ${daysRequested} days but only have ${bal.remaining} days remaining.\n\n*Your balance:*\n• Annual allowance: ${bal.allowance} days\n• Already taken: ${bal.taken} days\n• Remaining: ${bal.remaining} days`
+              });
+              res.statusCode = 200;
+              res.end("");
+              return;
+            }
+            
+            // Log the request to Google Sheets
+            await logRequest({ 
+              user: userId, 
+              start: parsed.start, 
+              end: parsed.end, 
+              reason: parsed.reason, 
+              manager: userInfo.managerId 
+            });
+            log.info("Request logged to sheets successfully", { userId });
+            
+            // Send confirmation to the requester
+            await app.client.chat.postMessage({
+              channel: userId,
+              text: `✅ *PTO Request Submitted!*\n\n*Details:*\n• Dates: ${parsed.start} to ${parsed.end} (${daysRequested} days)\n• Reason: ${parsed.reason}\n• Team: ${userInfo.team}\n• Manager: <@${userInfo.managerId}>\n\n*Your balance after approval:*\n• Current remaining: ${bal.remaining} days\n• After this request: ${bal.remaining - daysRequested} days\n\nYour request has been sent to your manager for approval. You'll be notified once they take action.`
+            });
+            log.info("Confirmation message sent to requester", { userId });
+            
+            // Send approval request to manager
+            const managerMessage = {
+              channel: userInfo.managerId,
+              text: `📋 *New PTO Request*`,
+              blocks: [
+                { 
+                  type: "section",
+                  text: { 
+                    type: "mrkdwn", 
+                    text: `📋 *New PTO Request*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Team:* ${userInfo.team}\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\n*Employee's Balance:*\n• Current remaining: ${bal.remaining} days\n• After approval: ${bal.remaining - daysRequested} days` 
+                  } 
+                },
+                {
+                  type: "actions",
+                  elements: [
+                    { 
+                      type: "button", 
+                      style: "primary", 
+                      text: { type: "plain_text", text: "✅ Approve" },
+                      value: JSON.stringify({ user: userId, start: parsed.start, end: parsed.end }), 
+                      action_id: "approve" 
+                    },
+                    { 
+                      type: "button", 
+                      style: "danger", 
+                      text: { type: "plain_text", text: "❌ Deny" },
+                      value: JSON.stringify({ user: userId, start: parsed.start, end: parsed.end }), 
+                      action_id: "deny" 
+                    }
+                  ]
+                }
+              ]
+            };
+            
+            await app.client.chat.postMessage(managerMessage);
+            log.info("Approval request sent to manager", { 
+              userId, 
+              managerId: userInfo.managerId 
+            });
+            
+            // Also notify HR for visibility (optional)
+            const hrId = process.env.HR_SLACK_ID;
+            if (hrId && hrId !== userInfo.managerId) {
+              await app.client.chat.postMessage({
+                channel: hrId,
+                text: `📊 *FYI - New PTO Request*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Team:* ${userInfo.team}\n*Manager:* <@${userInfo.managerId}>\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\n_Manager has been notified for approval._`
+              });
+              log.info("HR notified of PTO request", { hrId });
+            }
+            
           } catch (error) {
             log.error("Error processing PTO command", {
               userId,
@@ -610,7 +866,7 @@ export default async function handler(req, res) {
             
             await app.client.chat.postMessage({
               channel: userId,
-              text: "Sorry, there was an error processing your request. Please try again."
+              text: "❌ Sorry, there was an error processing your request. Please try again or contact IT support."
             });
           }
         }
@@ -624,21 +880,109 @@ export default async function handler(req, res) {
       body = JSON.parse(rawBody);
       log.debug("Parsed JSON body", { type: body.type });
       
+      // Handle event callbacks (messages)
+      if (body.type === "event_callback") {
+        log.info("Processing event callback", {
+          eventType: body.event?.type,
+          eventSubtype: body.event?.subtype,
+          userId: body.event?.user,
+          text: body.event?.text
+        });
+        
+        // Handle message events (for "yes" confirmation)
+        if (body.event?.type === "message" && !body.event?.subtype) {
+          const message = body.event;
+          
+          // Check if message is "yes" and has metadata
+          if (message.text && /^yes$/i.test(message.text)) {
+            log.info("Potential 'yes' confirmation received", {
+              user: message.user,
+              channel: message.channel,
+              hasMetadata: !!message.metadata
+            });
+            
+            // Check for confirmation metadata
+            if (message.metadata?.event_type === "awaiting_confirmation") {
+              const { start, end, reason } = message.metadata.event_payload;
+              const user = message.user;
+              const manager = process.env.HR_SLACK_ID;
+              
+              log.info("PTO confirmation received via event", {
+                user,
+                start,
+                end,
+                reason,
+                manager
+              });
+              
+              try {
+                await logRequest({ user, start, end, reason, manager });
+                log.info("Request logged to sheets successfully", { user });
+                
+                const managerMessage = {
+                  channel: manager,
+                  text: `PTO request from <@${user}>`,
+                  blocks: [
+                    { 
+                      type: "section",
+                      text: { 
+                        type: "mrkdwn", 
+                        text: `*PTO Request*\nUser: <@${user}>\n${start} → ${end}\nReason: ${reason}` 
+                      } 
+                    },
+                    {
+                      type: "actions",
+                      elements: [
+                        { 
+                          type: "button", 
+                          style: "primary", 
+                          text: { type: "plain_text", text: "Approve" },
+                          value: JSON.stringify({ user, start, end }), 
+                          action_id: "approve" 
+                        },
+                        { 
+                          type: "button", 
+                          style: "danger", 
+                          text: { type: "plain_text", text: "Deny" },
+                          value: JSON.stringify({ user }), 
+                          action_id: "deny" 
+                        }
+                      ]
+                    }
+                  ]
+                };
+                
+                await app.client.chat.postMessage(managerMessage);
+                log.info("Approval request sent to manager", { user, manager });
+                
+                await app.client.chat.postMessage({ 
+                  channel: user, 
+                  text: "Request sent for approval. 🎉" 
+                });
+                log.info("Confirmation sent to user", { user });
+              } catch (error) {
+                log.error("Error processing PTO confirmation from event", {
+                  user,
+                  error: error.message,
+                  stack: error.stack
+                });
+              }
+            }
+          }
+        }
+        
+        res.statusCode = 200;
+        res.end("");
+        return;
+      }
+      
       // Handle interactive components (buttons)
       if (body.type === "interactive_message" || body.type === "block_actions") {
-        log.info("Processing interactive component");
+        log.info("Processing interactive component", {
+          actionType: body.type,
+          actions: body.actions?.map(a => a.action_id)
+        });
         
-        const context = {
-          ack: async () => {
-            log.debug("Action acknowledged");
-            return Promise.resolve();
-          },
-          body: body,
-          client: app.client,
-          action: body.actions?.[0]
-        };
-        
-        // Get the action handler
         const actionId = body.actions?.[0]?.action_id;
         if (actionId === "approve" || actionId === "deny") {
           log.info(`Processing ${actionId} action directly`);
@@ -657,21 +1001,54 @@ export default async function handler(req, res) {
               end
             });
             
-            await app.client.chat.postMessage({ 
-              channel: user, 
-              text: `✅ Approved! Enjoy ${start} → ${end}` 
-            });
-            log.info("Approval notification sent to user", { user });
-            
-            await app.client.chat.update({ 
-              channel: body.channel.id, 
-              ts: body.message.ts, 
-              text: "Approved ✔️", 
-              blocks: [] 
-            });
-            log.info("Manager message updated with approval");
+            try {
+              // Update the request status in Google Sheets
+              await updateRequestStatus(user, start, end, "approved");
+              log.info("Request status updated to approved in Sheets", { user });
+              
+              // Calculate days for the message
+              const startDate = new Date(start);
+              const endDate = new Date(end);
+              const daysApproved = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+              
+              // Notify the employee
+              await app.client.chat.postMessage({ 
+                channel: user, 
+                text: `🎉 *Great news! Your PTO request has been approved!*\n\n*Approved dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n\nEnjoy your time off! Your PTO balance has been updated.` 
+              });
+              log.info("Approval notification sent to user", { user });
+              
+              // Update the manager's message
+              await app.client.chat.update({ 
+                channel: body.channel.id, 
+                ts: body.message.ts, 
+                text: `✅ *PTO Request Approved*\n\nApproved by <@${approver}> at ${new Date().toLocaleString()}`, 
+                blocks: [] 
+              });
+              log.info("Manager message updated with approval");
+              
+              // Notify HR if different from approver
+              const hrId = process.env.HR_SLACK_ID;
+              if (hrId && hrId !== approver) {
+                await app.client.chat.postMessage({
+                  channel: hrId,
+                  text: `✅ *PTO Approved*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n*Time:* ${new Date().toLocaleString()}\n\n_Employee's balance has been updated automatically._`
+                });
+                log.info("HR notified of approval", { hrId });
+              }
+            } catch (error) {
+              log.error("Error processing approval", {
+                error: error.message,
+                stack: error.stack
+              });
+              
+              await app.client.chat.postMessage({
+                channel: approver,
+                text: "⚠️ The approval was processed but there was an error updating the records. Please contact IT support."
+              });
+            }
           } else if (actionId === "deny") {
-            const { user } = actionValue;
+            const { user, start, end } = actionValue;
             const denier = body.user.id;
             
             log.info("PTO denial action received (direct)", {
@@ -680,19 +1057,47 @@ export default async function handler(req, res) {
               user
             });
             
-            await app.client.chat.postMessage({ 
-              channel: user, 
-              text: `❌ Sorry, your PTO request was denied.` 
-            });
-            log.info("Denial notification sent to user", { user });
-            
-            await app.client.chat.update({ 
-              channel: body.channel.id, 
-              ts: body.message.ts, 
-              text: "Denied ✖️", 
-              blocks: [] 
-            });
-            log.info("Manager message updated with denial");
+            try {
+              // Update the request status in Google Sheets
+              await updateRequestStatus(user, start, end, "denied");
+              log.info("Request status updated to denied in Sheets", { user });
+              
+              // Notify the employee
+              await app.client.chat.postMessage({ 
+                channel: user, 
+                text: `❌ *Your PTO request has been denied*\n\n*Requested dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n\nPlease speak with your manager if you have questions about this decision.` 
+              });
+              log.info("Denial notification sent to user", { user });
+              
+              // Update the manager's message
+              await app.client.chat.update({ 
+                channel: body.channel.id, 
+                ts: body.message.ts, 
+                text: `❌ *PTO Request Denied*\n\nDenied by <@${denier}> at ${new Date().toLocaleString()}`, 
+                blocks: [] 
+              });
+              log.info("Manager message updated with denial");
+              
+              // Notify HR if different from denier
+              const hrId = process.env.HR_SLACK_ID;
+              if (hrId && hrId !== denier) {
+                await app.client.chat.postMessage({
+                  channel: hrId,
+                  text: `❌ *PTO Denied*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n*Time:* ${new Date().toLocaleString()}`
+                });
+                log.info("HR notified of denial", { hrId });
+              }
+            } catch (error) {
+              log.error("Error processing denial", {
+                error: error.message,
+                stack: error.stack
+              });
+              
+              await app.client.chat.postMessage({
+                channel: denier,
+                text: "⚠️ The denial was processed but there was an error updating the records. Please contact IT support."
+              });
+            }
           }
         }
         
