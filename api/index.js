@@ -83,7 +83,7 @@ async function parsePto(text) {
 }
 
 // --- Slack Commands & Listeners ---
-app.command("/leave", async ({ ack, body, client }) => {
+app.command("/pto", async ({ ack, body, client }) => {
   await ack();
   const userId = body.user_id;
   const parsed = await parsePto(body.text);
