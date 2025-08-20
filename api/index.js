@@ -287,10 +287,12 @@ async function updateBalance(userId, start, end) {
   try {
     const client = await auth.getClient();
     
-    // Calculate days taken (simplified - you might want more complex logic)
+    // Calculate days taken (simplified - counting weekdays would be better)
     const startDate = new Date(start);
     const endDate = new Date(end);
     const daysTaken = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+    
+    log.info("Days calculated for PTO", { start, end, daysTaken });
     
     // Get current balance
     const balanceResult = await sheets.spreadsheets.values.get({
@@ -303,17 +305,25 @@ async function updateBalance(userId, start, end) {
     const rowIndex = rows.findIndex(r => r[0] === userId);
     
     if (rowIndex === -1) {
-      log.warn("User not found in Balances sheet", { userId });
-      return;
+      log.error("User not found in Balances sheet for update", { userId });
+      throw new Error(`User ${userId} not found in Balances sheet`);
     }
     
     const currentTaken = Number(rows[rowIndex][2]) || 0;
     const newTaken = currentTaken + daysTaken;
     
     // Update the taken_so_far column (C)
-    const updateRange = `Balances!C${rowIndex + 2}`;
+    const updateRange = `Balances!C${rowIndex + 2}`; // +2 because we start from row 2
     
-    await sheets.spreadsheets.values.update({
+    log.info("Updating balance in sheet", { 
+      userId,
+      updateRange,
+      currentTaken,
+      daysTaken,
+      newTaken
+    });
+    
+    const updateResult = await sheets.spreadsheets.values.update({
       auth: client,
       spreadsheetId,
       range: updateRange,
@@ -327,8 +337,12 @@ async function updateBalance(userId, start, end) {
       userId, 
       daysTaken, 
       previousBalance: currentTaken,
-      newBalance: newTaken 
+      newBalance: newTaken,
+      updatedCells: updateResult.data.updatedCells,
+      updatedRange: updateResult.data.updatedRange
     });
+    
+    return { daysTaken, previousBalance: currentTaken, newBalance: newTaken };
     
   } catch (error) {
     log.error("Failed to update balance", {
@@ -336,7 +350,9 @@ async function updateBalance(userId, start, end) {
       error: error.message,
       stack: error.stack
     });
-    throw error;
+    // Don't throw - we want the approval to succeed even if balance update fails
+    // The error is logged and can be fixed manually
+    return null;
   }
 }
 
@@ -951,8 +967,53 @@ export default async function handler(req, res) {
             log.info("Confirmation message sent to requester", { userId });
             
             // Send approval request to manager
+            // First, try to open a conversation with the manager
+            let managerChannel;
+            try {
+              const conversation = await app.client.conversations.open({
+                users: userInfo.managerId
+              });
+              managerChannel = conversation.channel.id;
+              log.info("Opened DM channel with manager", { 
+                managerId: userInfo.managerId, 
+                channelId: managerChannel 
+              });
+            } catch (error) {
+              log.error("Failed to open DM with manager", {
+                managerId: userInfo.managerId,
+                error: error.message
+              });
+              
+              // Notify the requester of the issue
+              await app.client.chat.postMessage({
+                channel: userId,
+                text: `⚠️ I couldn't send the approval request to your manager (<@${userInfo.managerId}>). Please contact them directly or notify IT support.\n\nManager ID: ${userInfo.managerId}`
+              });
+              
+              // Try to notify HR as backup
+              const hrId = process.env.HR_SLACK_ID;
+              if (hrId) {
+                try {
+                  const hrConversation = await app.client.conversations.open({
+                    users: hrId
+                  });
+                  await app.client.chat.postMessage({
+                    channel: hrConversation.channel.id,
+                    text: `⚠️ *Manager Unreachable - Manual Approval Needed*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Manager:* <@${userInfo.managerId}>\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\nCouldn't send to manager's DM. Please handle manually.`
+                  });
+                  log.info("HR notified as backup for unreachable manager");
+                } catch (hrError) {
+                  log.error("Failed to notify HR as backup", { error: hrError.message });
+                }
+              }
+              
+              res.statusCode = 200;
+              res.end("");
+              return;
+            }
+            
             const managerMessage = {
-              channel: userInfo.managerId,
+              channel: managerChannel,
               text: `📋 *New PTO Request*`,
               blocks: [
                 { 
@@ -987,17 +1048,25 @@ export default async function handler(req, res) {
             await app.client.chat.postMessage(managerMessage);
             log.info("Approval request sent to manager", { 
               userId, 
-              managerId: userInfo.managerId 
+              managerId: userInfo.managerId,
+              managerChannel 
             });
             
             // Also notify HR for visibility (optional)
             const hrId = process.env.HR_SLACK_ID;
             if (hrId && hrId !== userInfo.managerId) {
-              await app.client.chat.postMessage({
-                channel: hrId,
-                text: `📊 *FYI - New PTO Request*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Team:* ${userInfo.team}\n*Manager:* <@${userInfo.managerId}>\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\n_Manager has been notified for approval._`
-              });
-              log.info("HR notified of PTO request", { hrId });
+              try {
+                const hrConversation = await app.client.conversations.open({
+                  users: hrId
+                });
+                await app.client.chat.postMessage({
+                  channel: hrConversation.channel.id,
+                  text: `📊 *FYI - New PTO Request*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Team:* ${userInfo.team}\n*Manager:* <@${userInfo.managerId}>\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\n_Manager has been notified for approval._`
+                });
+                log.info("HR notified of PTO request", { hrId });
+              } catch (hrError) {
+                log.warn("Failed to notify HR", { error: hrError.message });
+              }
             }
             
           } catch (error) {
