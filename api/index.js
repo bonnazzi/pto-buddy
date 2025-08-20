@@ -146,6 +146,28 @@ app.action("deny", async ({ ack, body, client }) => {
 
 // --- Vercel Handler ---
 export default function handler(req, res) {
-  receiver.app(req, res);
+  if (req.method === "POST") {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const payload = JSON.parse(body);
+        if (payload.type === "url_verification" && payload.challenge) {
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "text/plain");
+          res.end(payload.challenge);
+        } else {
+          // Pass all other requests to Bolt
+          receiver.app(req, res);
+        }
+      } catch (err) {
+        res.statusCode = 400;
+        res.end("Bad request");
+      }
+    });
+  } else {
+    res.statusCode = 404;
+    res.end("Not found");
+  }
 }
 
