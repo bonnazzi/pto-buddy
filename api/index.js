@@ -359,7 +359,12 @@ async function updateBalance(userId, start, end) {
 async function parsePto(text) {
   log.info("Parsing PTO request with OpenRouter", { inputText: text });
   
-  const prompt = `Extract PTO info from: "${text}". Return JSON like {"start":"YYYY-MM-DD","end":"YYYY-MM-DD","reason":"..."} (if one date, use for both).`;
+  const prompt = `Extract PTO info from: "${text}". 
+Return JSON like {"start":"YYYY-MM-DD","end":"YYYY-MM-DD","reason":"..."}.
+If only one date, use it for both start and end.
+If no specific dates are mentioned, use tomorrow as start and 3 days later as end.
+Today's date is ${new Date().toISOString().split('T')[0]}.
+Always return actual dates, never placeholders like "YYYY-MM-DD".`;
   
   const requestBody = {
     model: "openai/gpt-3.5-turbo",
@@ -403,6 +408,24 @@ async function parsePto(text) {
     log.debug("OpenRouter raw response", data);
     
     const parsedContent = JSON.parse(data.choices[0].message.content.trim());
+    
+    // Validate the parsed dates
+    if (parsedContent.start === "YYYY-MM-DD" || parsedContent.end === "YYYY-MM-DD") {
+      log.warn("LLM returned placeholder dates, using defaults", { parsedContent });
+      
+      // Default to next Monday for a week if no dates specified
+      const today = new Date();
+      const daysUntilMonday = (8 - today.getDay()) % 7 || 7;
+      const nextMonday = new Date(today);
+      nextMonday.setDate(today.getDate() + daysUntilMonday);
+      const nextFriday = new Date(nextMonday);
+      nextFriday.setDate(nextMonday.getDate() + 4);
+      
+      parsedContent.start = nextMonday.toISOString().split('T')[0];
+      parsedContent.end = nextFriday.toISOString().split('T')[0];
+      parsedContent.reason = parsedContent.reason || "vacation";
+    }
+    
     log.info("PTO parsing successful", {
       inputText: text,
       parsedResult: parsedContent
@@ -897,6 +920,23 @@ export default async function handler(req, res) {
             // Parse the PTO request
             const parsed = await parsePto(commandText);
             log.info("PTO text parsed successfully", { userId, parsed });
+            
+            // Check if dates seem reasonable
+            const startDate = new Date(parsed.start);
+            const endDate = new Date(parsed.end);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            
+            if (startDate < today) {
+              log.warn("Start date is in the past", { start: parsed.start });
+              await app.client.chat.postMessage({
+                channel: userId,
+                text: `⚠️ The start date (${parsed.start}) appears to be in the past. Please submit a new request with future dates.\n\nExample: \`/pto next Monday to Friday for vacation\``
+              });
+              res.statusCode = 200;
+              res.end("");
+              return;
+            }
             
             // Get user info from Teams sheet
             const userInfo = await getUserInfo(userId);
