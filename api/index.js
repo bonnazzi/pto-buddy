@@ -2,13 +2,14 @@ export const config = { api: { bodyParser: false } };
 
 // --- Imports ---
 import boltPkg from "@slack/bolt";
-const { App, AwsLambdaReceiver } = boltPkg;
+const { App } = boltPkg;
 
 import gapiPkg from "googleapis";
 const { google } = gapiPkg;
 
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import crypto from "crypto";
 dotenv.config();
 
 // --- Logging Helper ---
@@ -31,16 +32,48 @@ const log = {
   }
 };
 
-// --- AWS Lambda Receiver for Vercel (works with serverless) ---
-log.info("Initializing AwsLambdaReceiver for serverless environment");
-const awsLambdaReceiver = new AwsLambdaReceiver({
+// --- Custom Receiver for Vercel ---
+class VercelReceiver {
+  constructor({ signingSecret }) {
+    this.signingSecret = signingSecret;
+    this.app = null;
+  }
+  
+  init(app) {
+    this.app = app;
+  }
+  
+  async verifySignature(rawBody, signature, timestamp) {
+    const hmac = crypto.createHmac("sha256", this.signingSecret);
+    hmac.update(`v0:${timestamp}:${rawBody}`);
+    const computed = `v0=${hmac.digest("hex")}`;
+    return computed === signature;
+  }
+  
+  parseUrlEncoded(body) {
+    const params = new URLSearchParams(body);
+    const result = {};
+    for (const [key, value] of params) {
+      result[key] = value;
+    }
+    return result;
+  }
+}
+
+log.info("Initializing custom Vercel receiver");
+const receiver = new VercelReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET
 });
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  receiver: awsLambdaReceiver
+  receiver,
+  logLevel: "DEBUG"
 });
+
+// Initialize the receiver with the app
+receiver.init(app);
+
 log.info("Slack App initialized successfully");
 
 // --- Google Sheets setup ---
@@ -468,44 +501,219 @@ export default async function handler(req, res) {
     }
   }
   
-  // Convert Vercel request to AWS Lambda format for Bolt
-  const lambdaEvent = {
-    body: rawBody,
-    headers: req.headers,
-    isBase64Encoded: false,
-    httpMethod: req.method,
-    path: req.url
-  };
+  // Verify Slack signature
+  const signature = req.headers["x-slack-signature"];
+  const timestamp = req.headers["x-slack-request-timestamp"];
   
-  log.debug("Lambda event created for Bolt", {
-    httpMethod: lambdaEvent.httpMethod,
-    path: lambdaEvent.path,
-    hasBody: !!lambdaEvent.body,
-    headers: Object.keys(lambdaEvent.headers)
-  });
+  if (!signature || !timestamp) {
+    log.error("Missing Slack signature or timestamp", {
+      hasSignature: !!signature,
+      hasTimestamp: !!timestamp
+    });
+    res.statusCode = 400;
+    return res.end("Bad request");
+  }
+  
+  const isValid = await receiver.verifySignature(rawBody, signature, timestamp);
+  if (!isValid) {
+    log.error("Invalid Slack signature");
+    res.statusCode = 401;
+    return res.end("Unauthorized");
+  }
+  
+  log.info("Slack signature verified successfully");
   
   try {
-    // Process through Bolt's AWS Lambda receiver
-    const response = await awsLambdaReceiver.start(lambdaEvent);
-    
-    log.info("Bolt processing complete", {
-      statusCode: response.statusCode,
-      hasBody: !!response.body
-    });
-    
-    // Send Bolt's response back through Vercel
-    res.statusCode = response.statusCode;
-    
-    if (response.headers) {
-      Object.entries(response.headers).forEach(([key, value]) => {
-        res.setHeader(key, value);
+    // Parse the request based on content type
+    let body;
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      body = receiver.parseUrlEncoded(rawBody);
+      log.debug("Parsed URL-encoded body", {
+        command: body.command,
+        userId: body.user_id,
+        text: body.text
       });
+      
+      // Handle slash commands
+      if (body.command === "/pto") {
+        log.info("Processing /pto command directly");
+        
+        // Create the context object that Bolt expects
+        const context = {
+          ack: async () => {
+            log.debug("Command acknowledged");
+            return Promise.resolve();
+          },
+          body: body,
+          client: app.client,
+          command: body
+        };
+        
+        // Get the registered command handler
+        const commandHandlers = app._listeners?.slash_command || [];
+        const ptoHandler = commandHandlers.find(h => h.commandName === "/pto");
+        
+        if (ptoHandler) {
+          log.info("Found PTO handler, executing");
+          await ptoHandler.listener(context);
+        } else {
+          // Fallback: execute the handler directly
+          log.info("Executing PTO handler directly");
+          const userId = body.user_id;
+          const commandText = body.text;
+          
+          log.info("PTO command received (direct)", {
+            userId,
+            userName: body.user_name,
+            commandText,
+            channelId: body.channel_id,
+            teamId: body.team_id
+          });
+          
+          try {
+            const parsed = await parsePto(commandText);
+            log.info("PTO text parsed successfully", { userId, parsed });
+            
+            const bal = await getBalance(userId);
+            log.info("User balance retrieved", { userId, balance: bal });
+            
+            if (bal.remaining <= 0) {
+              log.warn("User has insufficient PTO balance", { userId, balance: bal });
+              
+              await app.client.chat.postMessage({
+                channel: userId,
+                text: `You're out of PTO (used ${bal.taken}/${bal.allowance}).`
+              });
+              log.info("Insufficient balance message sent to user", { userId });
+            } else {
+              const confirmationMessage = {
+                channel: userId,
+                text: `Requesting ${parsed.start} → ${parsed.end} for *${parsed.reason}*.\nReply "yes" to confirm.`,
+                metadata: { event_type: "awaiting_confirmation", event_payload: { ...parsed } }
+              };
+              
+              log.debug("Sending confirmation message", confirmationMessage);
+              
+              await app.client.chat.postMessage(confirmationMessage);
+              log.info("Confirmation request sent to user", {
+                userId,
+                ptoRequest: parsed
+              });
+            }
+          } catch (error) {
+            log.error("Error processing PTO command", {
+              userId,
+              commandText,
+              error: error.message,
+              stack: error.stack
+            });
+            
+            await app.client.chat.postMessage({
+              channel: userId,
+              text: "Sorry, there was an error processing your request. Please try again."
+            });
+          }
+        }
+        
+        // Return immediate 200 OK to Slack
+        res.statusCode = 200;
+        res.end("");
+        return;
+      }
+    } else if (contentType.includes("application/json")) {
+      body = JSON.parse(rawBody);
+      log.debug("Parsed JSON body", { type: body.type });
+      
+      // Handle interactive components (buttons)
+      if (body.type === "interactive_message" || body.type === "block_actions") {
+        log.info("Processing interactive component");
+        
+        const context = {
+          ack: async () => {
+            log.debug("Action acknowledged");
+            return Promise.resolve();
+          },
+          body: body,
+          client: app.client,
+          action: body.actions?.[0]
+        };
+        
+        // Get the action handler
+        const actionId = body.actions?.[0]?.action_id;
+        if (actionId === "approve" || actionId === "deny") {
+          log.info(`Processing ${actionId} action directly`);
+          
+          const actionValue = JSON.parse(body.actions[0].value);
+          
+          if (actionId === "approve") {
+            const { user, start, end } = actionValue;
+            const approver = body.user.id;
+            
+            log.info("PTO approval action received (direct)", {
+              approver,
+              approverName: body.user.name,
+              user,
+              start,
+              end
+            });
+            
+            await app.client.chat.postMessage({ 
+              channel: user, 
+              text: `✅ Approved! Enjoy ${start} → ${end}` 
+            });
+            log.info("Approval notification sent to user", { user });
+            
+            await app.client.chat.update({ 
+              channel: body.channel.id, 
+              ts: body.message.ts, 
+              text: "Approved ✔️", 
+              blocks: [] 
+            });
+            log.info("Manager message updated with approval");
+          } else if (actionId === "deny") {
+            const { user } = actionValue;
+            const denier = body.user.id;
+            
+            log.info("PTO denial action received (direct)", {
+              denier,
+              denierName: body.user.name,
+              user
+            });
+            
+            await app.client.chat.postMessage({ 
+              channel: user, 
+              text: `❌ Sorry, your PTO request was denied.` 
+            });
+            log.info("Denial notification sent to user", { user });
+            
+            await app.client.chat.update({ 
+              channel: body.channel.id, 
+              ts: body.message.ts, 
+              text: "Denied ✖️", 
+              blocks: [] 
+            });
+            log.info("Manager message updated with denial");
+          }
+        }
+        
+        res.statusCode = 200;
+        res.end("");
+        return;
+      }
     }
     
-    res.end(response.body || "");
+    // For any unhandled request types
+    log.warn("Unhandled request type", {
+      contentType,
+      bodyType: body?.type,
+      command: body?.command
+    });
+    
+    res.statusCode = 200;
+    res.end("");
     
   } catch (error) {
-    log.error("Error processing request through Bolt", {
+    log.error("Error processing request", {
       error: error.message,
       stack: error.stack
     });
