@@ -2,7 +2,7 @@ export const config = { api: { bodyParser: false } };
 
 // --- Imports ---
 import boltPkg from "@slack/bolt";
-const { App, ExpressReceiver } = boltPkg;
+const { App, AwsLambdaReceiver } = boltPkg;
 
 import gapiPkg from "googleapis";
 const { google } = gapiPkg;
@@ -31,16 +31,15 @@ const log = {
   }
 };
 
-// --- ExpressReceiver for Vercel ---
-log.info("Initializing ExpressReceiver");
-const receiver = new ExpressReceiver({
+// --- AWS Lambda Receiver for Vercel (works with serverless) ---
+log.info("Initializing AwsLambdaReceiver for serverless environment");
+const awsLambdaReceiver = new AwsLambdaReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET
 });
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  receiver,
-  appToken: process.env.APP_TOKEN || "unused"
+  receiver: awsLambdaReceiver
 });
 log.info("Slack App initialized successfully");
 
@@ -423,11 +422,11 @@ app.action("deny", async ({ ack, body, client }) => {
 });
 
 // --- Vercel Handler ---
-export default function handler(req, res) {
+export default async function handler(req, res) {
   log.info("Vercel handler invoked", {
     method: req.method,
     url: req.url,
-    headers: req.headers
+    contentType: req.headers["content-type"]
   });
   
   if (req.method !== "POST") {
@@ -439,65 +438,81 @@ export default function handler(req, res) {
     return res.end("Not found");
   }
   
-  // Collect the raw body
-  let rawBody = "";
-  req.on("data", chunk => {
-    rawBody += chunk.toString();
+  // Read the raw body
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+  const rawBody = Buffer.concat(chunks).toString();
+  
+  log.debug("Request body received", {
+    bodyLength: rawBody.length,
+    bodyPreview: rawBody.substring(0, 200)
   });
   
-  req.on("end", async () => {
+  // Check for Slack URL verification (special case)
+  const contentType = req.headers["content-type"] || "";
+  if (contentType.includes("application/json")) {
     try {
-      const contentType = req.headers["content-type"] || "";
-      log.debug("Request received", { 
-        contentType, 
-        bodyLength: rawBody.length,
-        bodyPreview: rawBody.substring(0, 200) 
-      });
-      
-      // Handle Slack URL verification separately
-      if (contentType.includes("application/json")) {
-        try {
-          const payload = JSON.parse(rawBody);
-          if (payload.type === "url_verification" && payload.challenge) {
-            log.info("Slack URL verification challenge received", {
-              challenge: payload.challenge
-            });
-            res.statusCode = 200;
-            res.setHeader("Content-Type", "text/plain");
-            return res.end(payload.challenge);
-          }
-        } catch (e) {
-          log.debug("Not a URL verification request or JSON parse error", { error: e.message });
-        }
+      const payload = JSON.parse(rawBody);
+      if (payload.type === "url_verification" && payload.challenge) {
+        log.info("Slack URL verification challenge received", {
+          challenge: payload.challenge
+        });
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "text/plain");
+        return res.end(payload.challenge);
       }
-      
-      // For all other Slack requests, pass to Bolt receiver
-      log.info("Processing Slack request through Bolt receiver", {
-        contentType,
-        isSlashCommand: rawBody.includes("command=%2F"),
-        isInteractive: rawBody.includes("payload=")
-      });
-      
-      // Attach the raw body to the request object for Bolt to process
-      req.rawBody = Buffer.from(rawBody);
-      req.body = rawBody;
-      
-      // Pass to Bolt's Express app
-      receiver.app(req, res);
-      
-      log.debug("Request passed to Bolt receiver");
-      
-    } catch (error) {
-      log.error("Error processing request", {
-        error: error.message,
-        stack: error.stack,
-        bodyPreview: rawBody.substring(0, 500)
-      });
-      
-      if (!res.headersSent) {
-        res.statusCode = 500;
-        res.end("Internal server error");
-      }
+    } catch (e) {
+      log.debug("Not a URL verification request", { error: e.message });
     }
+  }
+  
+  // Convert Vercel request to AWS Lambda format for Bolt
+  const lambdaEvent = {
+    body: rawBody,
+    headers: req.headers,
+    isBase64Encoded: false,
+    httpMethod: req.method,
+    path: req.url
+  };
+  
+  log.debug("Lambda event created for Bolt", {
+    httpMethod: lambdaEvent.httpMethod,
+    path: lambdaEvent.path,
+    hasBody: !!lambdaEvent.body,
+    headers: Object.keys(lambdaEvent.headers)
   });
+  
+  try {
+    // Process through Bolt's AWS Lambda receiver
+    const response = await awsLambdaReceiver.start(lambdaEvent);
+    
+    log.info("Bolt processing complete", {
+      statusCode: response.statusCode,
+      hasBody: !!response.body
+    });
+    
+    // Send Bolt's response back through Vercel
+    res.statusCode = response.statusCode;
+    
+    if (response.headers) {
+      Object.entries(response.headers).forEach(([key, value]) => {
+        res.setHeader(key, value);
+      });
+    }
+    
+    res.end(response.body || "");
+    
+  } catch (error) {
+    log.error("Error processing request through Bolt", {
+      error: error.message,
+      stack: error.stack
+    });
+    
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.end("Internal server error");
+    }
+  }
 }
