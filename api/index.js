@@ -922,12 +922,12 @@ export default async function handler(req, res) {
             log.info("PTO text parsed successfully", { userId, parsed });
             
             // Check if dates seem reasonable
-            const startDate = new Date(parsed.start);
-            const endDate = new Date(parsed.end);
+            const requestStartDate = new Date(parsed.start);
+            const requestEndDate = new Date(parsed.end);
             const today = new Date();
             today.setHours(0, 0, 0, 0);
             
-            if (startDate < today) {
+            if (requestStartDate < today) {
               log.warn("Start date is in the past", { start: parsed.start });
               await app.client.chat.postMessage({
                 channel: userId,
@@ -969,9 +969,7 @@ export default async function handler(req, res) {
             }
             
             // Calculate days requested
-            const startDate = new Date(parsed.start);
-            const endDate = new Date(parsed.end);
-            const daysRequested = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+            const daysRequested = Math.ceil((requestEndDate - requestStartDate) / (1000 * 60 * 60 * 24)) + 1;
             
             if (daysRequested > bal.remaining) {
               log.warn("User requesting more days than available", { 
