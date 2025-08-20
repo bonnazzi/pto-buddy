@@ -146,8 +146,7 @@ app.action("deny", async ({ ack, body, client }) => {
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: "Denied ✖️", blocks: [] });
 });
 
-/* 8️⃣  Export a Vercel handler */
-export default async function handler(req, res) {
-  await app.start();                    // spins up Bolt
-  await app.receiver.requestListener(req, res);
+export default function handler(req, res) {
+  app.receiver.requestListener(req, res);   // pass the request straight to Bolt
 }
+
