@@ -1,10 +1,10 @@
-/* ---------- api/index.js ---------- */
-/* 1️⃣  Let Slack send the raw body (needed for signature verification) */
+// api/index.js
+
 export const config = { api: { bodyParser: false } };
 
-/* 2️⃣  Imports — use the CommonJS-friendly pattern */
+// --- Imports ---
 import boltPkg from "@slack/bolt";
-const { App } = boltPkg;
+const { App, ExpressReceiver } = boltPkg;
 
 import gapiPkg from "googleapis";
 const { google } = gapiPkg;
@@ -13,15 +13,18 @@ import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
-/* 3️⃣  Bolt app initialisation */
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,          // xoxb-…
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: false,
-  appToken: process.env.APP_TOKEN || "unused"  // any string if socketMode=false
+// --- ExpressReceiver for Vercel ---
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET
 });
 
-/* 4️⃣  Google Sheets set-up */
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  receiver,
+  appToken: process.env.APP_TOKEN || "unused"
+});
+
+// --- Google Sheets setup ---
 const sheets = google.sheets("v4");
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GCP_JSON),
@@ -29,7 +32,7 @@ const auth = new google.auth.GoogleAuth({
 });
 const spreadsheetId = process.env.SPREADSHEET_ID;
 
-/* Helpers */
+// --- Helpers ---
 async function getBalance(userId) {
   const client = await auth.getClient();
   const result = await sheets.spreadsheets.values.get({
@@ -64,7 +67,6 @@ async function logRequest(obj) {
   });
 }
 
-/* Very simple natural-language parser via OpenRouter */
 async function parsePto(text) {
   const prompt = `Extract PTO info from: "${text}". Return JSON like {"start":"YYYY-MM-DD","end":"YYYY-MM-DD","reason":"..."} (if one date, use for both).`;
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -82,7 +84,7 @@ async function parsePto(text) {
   return JSON.parse(data.choices[0].message.content.trim());
 }
 
-/* 5  /leave slash command */
+// --- Slack Commands & Listeners ---
 app.command("/leave", async ({ ack, body, client }) => {
   await ack();
   const userId = body.user_id;
@@ -104,7 +106,6 @@ app.command("/leave", async ({ ack, body, client }) => {
   });
 });
 
-/* 6️⃣  Confirmation listener */
 app.message(/^yes$/i, async ({ message, client }) => {
   if (!message.metadata || message.metadata.event_type !== "awaiting_confirmation") return;
   const { start, end, reason } = message.metadata.event_payload;
@@ -132,7 +133,6 @@ app.message(/^yes$/i, async ({ message, client }) => {
   await client.chat.postMessage({ channel: user, text: "Request sent for approval. 🎉" });
 });
 
-/* 7️⃣  Approve / Deny buttons */
 app.action("approve", async ({ ack, body, client }) => {
   await ack();
   const { user, start, end } = JSON.parse(body.actions[0].value);
@@ -146,7 +146,5 @@ app.action("deny", async ({ ack, body, client }) => {
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: "Denied ✖️", blocks: [] });
 });
 
-export default function handler(req, res) {
-  app.receiver.requestListener(req, res);   // pass the request straight to Bolt
-}
-
+// --- Vercel Handler ---
+export default receiver.toHandler();
