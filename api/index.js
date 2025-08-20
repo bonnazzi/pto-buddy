@@ -694,8 +694,152 @@ export default async function handler(req, res) {
       log.debug("Parsed URL-encoded body", {
         command: body.command,
         userId: body.user_id,
-        text: body.text
+        text: body.text,
+        hasPayload: !!body.payload
       });
+      
+      // Check if this is an interactive component (has payload)
+      if (body.payload) {
+        log.info("Processing interactive payload");
+        const payload = JSON.parse(body.payload);
+        log.debug("Parsed interactive payload", {
+          type: payload.type,
+          actions: payload.actions?.map(a => a.action_id)
+        });
+        
+        // Handle block actions (button clicks)
+        if (payload.type === "block_actions") {
+          const actionId = payload.actions?.[0]?.action_id;
+          const actionValue = JSON.parse(payload.actions[0].value);
+          
+          log.info(`Processing ${actionId} action from interactive payload`);
+          
+          if (actionId === "approve") {
+            const { user, start, end } = actionValue;
+            const approver = payload.user.id;
+            
+            log.info("PTO approval action received", {
+              approver,
+              approverName: payload.user.name,
+              user,
+              start,
+              end
+            });
+            
+            try {
+              // Update the request status in Google Sheets
+              await updateRequestStatus(user, start, end, "approved");
+              log.info("Request status updated to approved in Sheets", { user });
+              
+              // Calculate days for the message
+              const startDate = new Date(start);
+              const endDate = new Date(end);
+              const daysApproved = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
+              
+              // Notify the employee
+              await app.client.chat.postMessage({ 
+                channel: user, 
+                text: `🎉 *Great news! Your PTO request has been approved!*\n\n*Approved dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n\nEnjoy your time off! Your PTO balance has been updated.` 
+              });
+              log.info("Approval notification sent to user", { user });
+              
+              // Update the manager's message
+              await app.client.chat.update({ 
+                channel: payload.channel.id, 
+                ts: payload.message.ts, 
+                text: `✅ *PTO Request Approved*\n\nApproved by <@${approver}> at ${new Date().toLocaleString()}`, 
+                blocks: [] 
+              });
+              log.info("Manager message updated with approval");
+              
+              // Notify HR if different from approver
+              const hrId = process.env.HR_SLACK_ID;
+              if (hrId && hrId !== approver) {
+                await app.client.chat.postMessage({
+                  channel: hrId,
+                  text: `✅ *PTO Approved*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n*Time:* ${new Date().toLocaleString()}\n\n_Employee's balance has been updated automatically._`
+                });
+                log.info("HR notified of approval", { hrId });
+              }
+            } catch (error) {
+              log.error("Error processing approval", {
+                error: error.message,
+                stack: error.stack
+              });
+              
+              await app.client.chat.postMessage({
+                channel: approver,
+                text: "⚠️ The approval was processed but there was an error updating the records. Please contact IT support."
+              });
+            }
+            
+            res.statusCode = 200;
+            res.end("");
+            return;
+            
+          } else if (actionId === "deny") {
+            const { user, start, end } = actionValue;
+            const denier = payload.user.id;
+            
+            log.info("PTO denial action received", {
+              denier,
+              denierName: payload.user.name,
+              user
+            });
+            
+            try {
+              // Update the request status in Google Sheets
+              await updateRequestStatus(user, start, end, "denied");
+              log.info("Request status updated to denied in Sheets", { user });
+              
+              // Notify the employee
+              await app.client.chat.postMessage({ 
+                channel: user, 
+                text: `❌ *Your PTO request has been denied*\n\n*Requested dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n\nPlease speak with your manager if you have questions about this decision.` 
+              });
+              log.info("Denial notification sent to user", { user });
+              
+              // Update the manager's message
+              await app.client.chat.update({ 
+                channel: payload.channel.id, 
+                ts: payload.message.ts, 
+                text: `❌ *PTO Request Denied*\n\nDenied by <@${denier}> at ${new Date().toLocaleString()}`, 
+                blocks: [] 
+              });
+              log.info("Manager message updated with denial");
+              
+              // Notify HR if different from denier
+              const hrId = process.env.HR_SLACK_ID;
+              if (hrId && hrId !== denier) {
+                await app.client.chat.postMessage({
+                  channel: hrId,
+                  text: `❌ *PTO Denied*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n*Time:* ${new Date().toLocaleString()}`
+                });
+                log.info("HR notified of denial", { hrId });
+              }
+            } catch (error) {
+              log.error("Error processing denial", {
+                error: error.message,
+                stack: error.stack
+              });
+              
+              await app.client.chat.postMessage({
+                channel: denier,
+                text: "⚠️ The denial was processed but there was an error updating the records. Please contact IT support."
+              });
+            }
+            
+            res.statusCode = 200;
+            res.end("");
+            return;
+          }
+        }
+        
+        // Return 200 for any other interactive payloads
+        res.statusCode = 200;
+        res.end("");
+        return;
+      }
       
       // Handle slash commands
       if (body.command === "/pto") {
@@ -889,216 +1033,14 @@ export default async function handler(req, res) {
           text: body.event?.text
         });
         
-        // Handle message events (for "yes" confirmation)
+        // Handle message events (for "yes" confirmation if needed)
         if (body.event?.type === "message" && !body.event?.subtype) {
           const message = body.event;
-          
-          // Check if message is "yes" and has metadata
-          if (message.text && /^yes$/i.test(message.text)) {
-            log.info("Potential 'yes' confirmation received", {
-              user: message.user,
-              channel: message.channel,
-              hasMetadata: !!message.metadata
-            });
-            
-            // Check for confirmation metadata
-            if (message.metadata?.event_type === "awaiting_confirmation") {
-              const { start, end, reason } = message.metadata.event_payload;
-              const user = message.user;
-              const manager = process.env.HR_SLACK_ID;
-              
-              log.info("PTO confirmation received via event", {
-                user,
-                start,
-                end,
-                reason,
-                manager
-              });
-              
-              try {
-                await logRequest({ user, start, end, reason, manager });
-                log.info("Request logged to sheets successfully", { user });
-                
-                const managerMessage = {
-                  channel: manager,
-                  text: `PTO request from <@${user}>`,
-                  blocks: [
-                    { 
-                      type: "section",
-                      text: { 
-                        type: "mrkdwn", 
-                        text: `*PTO Request*\nUser: <@${user}>\n${start} → ${end}\nReason: ${reason}` 
-                      } 
-                    },
-                    {
-                      type: "actions",
-                      elements: [
-                        { 
-                          type: "button", 
-                          style: "primary", 
-                          text: { type: "plain_text", text: "Approve" },
-                          value: JSON.stringify({ user, start, end }), 
-                          action_id: "approve" 
-                        },
-                        { 
-                          type: "button", 
-                          style: "danger", 
-                          text: { type: "plain_text", text: "Deny" },
-                          value: JSON.stringify({ user }), 
-                          action_id: "deny" 
-                        }
-                      ]
-                    }
-                  ]
-                };
-                
-                await app.client.chat.postMessage(managerMessage);
-                log.info("Approval request sent to manager", { user, manager });
-                
-                await app.client.chat.postMessage({ 
-                  channel: user, 
-                  text: "Request sent for approval. 🎉" 
-                });
-                log.info("Confirmation sent to user", { user });
-              } catch (error) {
-                log.error("Error processing PTO confirmation from event", {
-                  user,
-                  error: error.message,
-                  stack: error.stack
-                });
-              }
-            }
-          }
-        }
-        
-        res.statusCode = 200;
-        res.end("");
-        return;
-      }
-      
-      // Handle interactive components (buttons)
-      if (body.type === "interactive_message" || body.type === "block_actions") {
-        log.info("Processing interactive component", {
-          actionType: body.type,
-          actions: body.actions?.map(a => a.action_id)
-        });
-        
-        const actionId = body.actions?.[0]?.action_id;
-        if (actionId === "approve" || actionId === "deny") {
-          log.info(`Processing ${actionId} action directly`);
-          
-          const actionValue = JSON.parse(body.actions[0].value);
-          
-          if (actionId === "approve") {
-            const { user, start, end } = actionValue;
-            const approver = body.user.id;
-            
-            log.info("PTO approval action received (direct)", {
-              approver,
-              approverName: body.user.name,
-              user,
-              start,
-              end
-            });
-            
-            try {
-              // Update the request status in Google Sheets
-              await updateRequestStatus(user, start, end, "approved");
-              log.info("Request status updated to approved in Sheets", { user });
-              
-              // Calculate days for the message
-              const startDate = new Date(start);
-              const endDate = new Date(end);
-              const daysApproved = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
-              
-              // Notify the employee
-              await app.client.chat.postMessage({ 
-                channel: user, 
-                text: `🎉 *Great news! Your PTO request has been approved!*\n\n*Approved dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n\nEnjoy your time off! Your PTO balance has been updated.` 
-              });
-              log.info("Approval notification sent to user", { user });
-              
-              // Update the manager's message
-              await app.client.chat.update({ 
-                channel: body.channel.id, 
-                ts: body.message.ts, 
-                text: `✅ *PTO Request Approved*\n\nApproved by <@${approver}> at ${new Date().toLocaleString()}`, 
-                blocks: [] 
-              });
-              log.info("Manager message updated with approval");
-              
-              // Notify HR if different from approver
-              const hrId = process.env.HR_SLACK_ID;
-              if (hrId && hrId !== approver) {
-                await app.client.chat.postMessage({
-                  channel: hrId,
-                  text: `✅ *PTO Approved*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n*Time:* ${new Date().toLocaleString()}\n\n_Employee's balance has been updated automatically._`
-                });
-                log.info("HR notified of approval", { hrId });
-              }
-            } catch (error) {
-              log.error("Error processing approval", {
-                error: error.message,
-                stack: error.stack
-              });
-              
-              await app.client.chat.postMessage({
-                channel: approver,
-                text: "⚠️ The approval was processed but there was an error updating the records. Please contact IT support."
-              });
-            }
-          } else if (actionId === "deny") {
-            const { user, start, end } = actionValue;
-            const denier = body.user.id;
-            
-            log.info("PTO denial action received (direct)", {
-              denier,
-              denierName: body.user.name,
-              user
-            });
-            
-            try {
-              // Update the request status in Google Sheets
-              await updateRequestStatus(user, start, end, "denied");
-              log.info("Request status updated to denied in Sheets", { user });
-              
-              // Notify the employee
-              await app.client.chat.postMessage({ 
-                channel: user, 
-                text: `❌ *Your PTO request has been denied*\n\n*Requested dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n\nPlease speak with your manager if you have questions about this decision.` 
-              });
-              log.info("Denial notification sent to user", { user });
-              
-              // Update the manager's message
-              await app.client.chat.update({ 
-                channel: body.channel.id, 
-                ts: body.message.ts, 
-                text: `❌ *PTO Request Denied*\n\nDenied by <@${denier}> at ${new Date().toLocaleString()}`, 
-                blocks: [] 
-              });
-              log.info("Manager message updated with denial");
-              
-              // Notify HR if different from denier
-              const hrId = process.env.HR_SLACK_ID;
-              if (hrId && hrId !== denier) {
-                await app.client.chat.postMessage({
-                  channel: hrId,
-                  text: `❌ *PTO Denied*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n*Time:* ${new Date().toLocaleString()}`
-                });
-                log.info("HR notified of denial", { hrId });
-              }
-            } catch (error) {
-              log.error("Error processing denial", {
-                error: error.message,
-                stack: error.stack
-              });
-              
-              await app.client.chat.postMessage({
-                channel: denier,
-                text: "⚠️ The denial was processed but there was an error updating the records. Please contact IT support."
-              });
-            }
-          }
+          log.debug("Message event received", {
+            user: message.user,
+            text: message.text,
+            channel: message.channel
+          });
         }
         
         res.statusCode = 200;
