@@ -1,7 +1,11 @@
-export const config = { api: { bodyParser: false } };   // ⭐ keep Slack’s raw body
+export const config = { api: { bodyParser: false } }; // ⭐️ Needed for Slack
 
-import { App } from "@slack/bolt";
-import { google } from "googleapis";
+import pkg from "@slack/bolt";
+const { App } = pkg;
+
+import googleapisPkg from "googleapis";
+const { google } = googleapisPkg;
+
 import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
