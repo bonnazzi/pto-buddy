@@ -430,63 +430,74 @@ export default function handler(req, res) {
     headers: req.headers
   });
   
-  if (req.method === "POST") {
-    let body = "";
-    req.on("data", chunk => { body += chunk; });
-    req.on("end", async () => {
-      try {
-        // Check content type to determine how to parse the body
-        const contentType = req.headers["content-type"] || "";
-        log.debug("Request content type", { contentType, bodyPreview: body.substring(0, 200) });
-        
-        // Check if it's JSON (for Slack events like url_verification)
-        if (contentType.includes("application/json")) {
-          const payload = JSON.parse(body);
-          log.debug("JSON payload parsed", {
-            type: payload.type,
-            hasChallenge: !!payload.challenge
-          });
-          
+  if (req.method !== "POST") {
+    log.warn("Non-POST request received", {
+      method: req.method,
+      url: req.url
+    });
+    res.statusCode = 404;
+    return res.end("Not found");
+  }
+  
+  // Collect the raw body
+  let rawBody = "";
+  req.on("data", chunk => {
+    rawBody += chunk.toString();
+  });
+  
+  req.on("end", async () => {
+    try {
+      const contentType = req.headers["content-type"] || "";
+      log.debug("Request received", { 
+        contentType, 
+        bodyLength: rawBody.length,
+        bodyPreview: rawBody.substring(0, 200) 
+      });
+      
+      // Handle Slack URL verification separately
+      if (contentType.includes("application/json")) {
+        try {
+          const payload = JSON.parse(rawBody);
           if (payload.type === "url_verification" && payload.challenge) {
             log.info("Slack URL verification challenge received", {
               challenge: payload.challenge
             });
             res.statusCode = 200;
             res.setHeader("Content-Type", "text/plain");
-            res.end(payload.challenge);
-            return;
+            return res.end(payload.challenge);
           }
+        } catch (e) {
+          log.debug("Not a URL verification request or JSON parse error", { error: e.message });
         }
-        
-        // For URL-encoded data (slash commands) or other Slack requests,
-        // pass directly to Bolt receiver without parsing
-        log.info("Passing request to Bolt receiver", {
-          contentType,
-          bodyLength: body.length,
-          isUrlEncoded: contentType.includes("application/x-www-form-urlencoded")
-        });
-        
-        // Reconstruct the request for Bolt
-        req.body = body;
-        receiver.app(req, res);
-        
-      } catch (err) {
-        log.error("Error processing request", {
-          error: err.message,
-          stack: err.stack,
-          contentType: req.headers["content-type"],
-          body: body.substring(0, 500) // Log first 500 chars of body for debugging
-        });
-        res.statusCode = 400;
-        res.end("Bad request");
       }
-    });
-  } else {
-    log.warn("Non-POST request received", {
-      method: req.method,
-      url: req.url
-    });
-    res.statusCode = 404;
-    res.end("Not found");
-  }
+      
+      // For all other Slack requests, pass to Bolt receiver
+      log.info("Processing Slack request through Bolt receiver", {
+        contentType,
+        isSlashCommand: rawBody.includes("command=%2F"),
+        isInteractive: rawBody.includes("payload=")
+      });
+      
+      // Attach the raw body to the request object for Bolt to process
+      req.rawBody = Buffer.from(rawBody);
+      req.body = rawBody;
+      
+      // Pass to Bolt's Express app
+      receiver.app(req, res);
+      
+      log.debug("Request passed to Bolt receiver");
+      
+    } catch (error) {
+      log.error("Error processing request", {
+        error: error.message,
+        stack: error.stack,
+        bodyPreview: rawBody.substring(0, 500)
+      });
+      
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.end("Internal server error");
+      }
+    }
+  });
 }
