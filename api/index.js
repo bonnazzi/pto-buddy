@@ -1262,7 +1262,6 @@ export default async function handler(req, res) {
                 channel: denier,
                 text: "⚠️ The denial was processed but there was an error updating the records. Please contact IT support."
               });
-            }
             
             res.statusCode = 200;
             res.end("");
