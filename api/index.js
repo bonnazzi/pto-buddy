@@ -1,3 +1,5 @@
+export const config = { api: { bodyParser: false } };   // ⭐ keep Slack’s raw body
+
 import { App } from "@slack/bolt";
 import { google } from "googleapis";
 import fetch from "node-fetch";
