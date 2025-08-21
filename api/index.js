@@ -26,9 +26,6 @@ const log = {
   },
   debug: (message, data = {}) => {
     console.log(`[DEBUG] ${new Date().toISOString()} - ${message}`, JSON.stringify(data, null, 2));
-  },
-  warn: (message, data = {}) => {
-    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, JSON.stringify(data, null, 2));
   }
 };
 
@@ -60,7 +57,7 @@ class VercelReceiver {
   }
 }
 
-log.info("Initializing custom Vercel receiver");
+// Initialize receiver and app
 const receiver = new VercelReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET
 });
@@ -71,383 +68,121 @@ const app = new App({
   logLevel: "DEBUG"
 });
 
-// Initialize the receiver with the app
 receiver.init(app);
 
-log.info("Slack App initialized successfully");
-
 // --- Google Sheets setup ---
-log.info("Setting up Google Sheets client");
 const sheets = google.sheets("v4");
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GCP_JSON),
   scopes: ["https://www.googleapis.com/auth/spreadsheets"]
 });
 const spreadsheetId = process.env.SPREADSHEET_ID;
-log.info("Google Sheets setup complete", { spreadsheetId });
 
-// --- Helpers ---
+// --- Helper Functions ---
+
+// Calculate business days between two dates (excluding weekends)
+function calculateBusinessDays(startDate, endDate) {
+  let count = 0;
+  const current = new Date(startDate);
+  const end = new Date(endDate);
+  
+  while (current <= end) {
+    const dayOfWeek = current.getDay();
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) { // Not Sunday (0) or Saturday (6)
+      count++;
+    }
+    current.setDate(current.getDate() + 1);
+  }
+  
+  return count;
+}
+
+// Get user info from Slack
 async function getUserInfo(userId) {
-  log.info("Getting user info from Teams tab", { userId, spreadsheetId });
-  
   try {
-    const client = await auth.getClient();
-    log.debug("Google Auth client obtained for user info");
-    
-    const requestParams = {
-      auth: client,
-      spreadsheetId,
-      range: "Teams!A2:E1000"  // Extended to include Role column
-    };
-    
-    const result = await sheets.spreadsheets.values.get(requestParams);
-    log.info("Teams sheet response received", {
-      userId,
-      rowCount: result.data.values?.length || 0
-    });
-    
-    // ID is in column B (index 1)
-    const row = result.data.values?.find(r => r[1] === userId);
-    
-    if (!row) {
-      log.warn("User not found in Teams sheet", { userId });
-      return null;
-    }
-    
-    const userInfo = {
-      name: row[0],      // Team member name
-      userId: row[1],    // Slack ID
-      team: row[2],      // Team name
-      managerId: row[3], // Manager's Slack ID
-      role: row[4] || 'Employee'  // Role (default to Employee if not set)
-    };
-    
-    log.info("User info retrieved successfully", { userId, userInfo });
-    return userInfo;
-    
-  } catch (error) {
-    log.error("Failed to get user info from Teams sheet", {
-      userId,
-      error: error.message,
-      stack: error.stack
-    });
-    throw error;
-  }
-}
-
-async function checkReportAccess(requesterId, scope = 'self') {
-  const requesterInfo = await getUserInfo(requesterId);
-  
-  if (!requesterInfo) {
-    return { allowed: false, reason: 'User not found in system' };
-  }
-  
-  // Admin can see everything
-  if (requesterInfo.role === 'Admin') {
-    return { allowed: true, level: 'all', requesterInfo };
-  }
-  
-  // Manager can see self and direct reports
-  if (requesterInfo.role === 'Manager') {
-    if (scope === 'self' || scope === 'team') {
-      return { allowed: true, level: 'team', requesterInfo };
-    }
-    if (scope === 'all') {
-      return { allowed: false, reason: 'Managers can only view their team data' };
-    }
-  }
-  
-  // Employee can only see self
-  if (requesterInfo.role === 'Employee') {
-    if (scope === 'self') {
-      return { allowed: true, level: 'self', requesterInfo };
-    }
-    return { allowed: false, reason: 'Employees can only view their own data' };
-  }
-  
-  return { allowed: false, reason: 'Invalid role' };
-}
-
-async function getTeamMembers(managerId) {
-  log.info("Getting team members for manager", { managerId });
-  
-  try {
-    const client = await auth.getClient();
-    const result = await sheets.spreadsheets.values.get({
-      auth: client,
-      spreadsheetId,
-      range: "Teams!A2:E1000"
-    });
-    
-    const rows = result.data.values || [];
-    const teamMembers = rows
-      .filter(r => r[3] === managerId)  // Manager ID is in column D
-      .map(r => ({
-        name: r[0],
-        userId: r[1],
-        team: r[2],
-        role: r[4] || 'Employee'
-      }));
-    
-    log.info("Team members retrieved", { 
-      managerId, 
-      teamCount: teamMembers.length 
-    });
-    
-    return teamMembers;
-  } catch (error) {
-    log.error("Failed to get team members", {
-      managerId,
-      error: error.message
-    });
-    return [];
-  }
-}
-
-async function getAllRequests(filterUserId = null, filterStatus = null) {
-  log.info("Getting requests from Google Sheets", { filterUserId, filterStatus });
-  
-  try {
-    const client = await auth.getClient();
-    const result = await sheets.spreadsheets.values.get({
-      auth: client,
-      spreadsheetId,
-      range: "Requests!A2:G1000"
-    });
-    
-    let requests = result.data.values || [];
-    
-    // Parse into objects
-    requests = requests.map(r => ({
-      timestamp: r[0],
-      userId: r[1],
-      start: r[2],
-      end: r[3],
-      reason: r[4],
-      status: r[5],
-      managerId: r[6]
-    }));
-    
-    // Apply filters
-    if (filterUserId) {
-      if (Array.isArray(filterUserId)) {
-        requests = requests.filter(r => filterUserId.includes(r.userId));
-      } else {
-        requests = requests.filter(r => r.userId === filterUserId);
-      }
-    }
-    
-    if (filterStatus) {
-      requests = requests.filter(r => r.status === filterStatus);
-    }
-    
-    log.info("Requests retrieved", { 
-      totalCount: requests.length,
-      filtered: !!filterUserId || !!filterStatus
-    });
-    
-    return requests;
-  } catch (error) {
-    log.error("Failed to get requests", {
-      error: error.message
-    });
-    return [];
-  }
-}
-
-async function generateReport(userId, reportType, params = {}) {
-  log.info("Generating report", { userId, reportType, params });
-  
-  const access = await checkReportAccess(userId, params.scope || 'self');
-  
-  if (!access.allowed) {
+    const result = await app.client.users.info({ user: userId });
     return {
-      success: false,
-      message: `❌ Access Denied: ${access.reason}`
+      id: userId,
+      name: result.user.real_name || result.user.name,
+      email: result.user.profile.email
     };
+  } catch (error) {
+    log.error("Failed to get user info from Slack", { userId, error: error.message });
+    return { id: userId, name: "Unknown", email: "" };
   }
-  
-  const userInfo = access.requesterInfo;
-  let reportData = {};
-  
-  switch (reportType) {
-    case 'balance':
-      if (access.level === 'all') {
-        // Admin: get all balances - optimized version
-        const allUsers = await getAllUsers();
-        // Filter out invalid users
-        const validUsers = allUsers.filter(u => u.userId && u.userId !== "#N/A");
-        
-        // Get all balances in one batch call
-        const userIds = validUsers.map(u => u.userId);
-        const allBalances = await getAllBalances(userIds);
-        
-        // Combine user info with balances
-        const balances = validUsers.map(u => ({
-          ...u,
-          balance: allBalances[u.userId] || { allowance: 0, taken: 0, remaining: 0 }
-        }));
-        
-        reportData = { type: 'all_balances', data: balances };
-      } else if (access.level === 'team') {
-        // Manager: get team balances - optimized version
-        const teamMembers = await getTeamMembers(userId);
-        const validMembers = teamMembers.filter(u => u.userId && u.userId !== "#N/A");
-        
-        // Get all team balances in one batch call
-        const teamIds = [userId, ...validMembers.map(m => m.userId)];
-        const teamBalances = await getAllBalances(teamIds);
-        
-        // Combine user info with balances
-        const balances = validMembers.map(u => ({
-          ...u,
-          balance: teamBalances[u.userId] || { allowance: 0, taken: 0, remaining: 0 }
-        }));
-        
-        // Include manager's own balance
-        balances.unshift({
-          ...userInfo,
-          balance: teamBalances[userId] || { allowance: 0, taken: 0, remaining: 0 }
-        });
-        
-        reportData = { type: 'team_balances', data: balances };
-      } else {
-        // Employee: get own balance
-        const balance = await getBalance(userId);
-        reportData = { type: 'personal_balance', data: { ...userInfo, balance } };
-      }
-      break;
-      
-    case 'requests':
-      if (access.level === 'all') {
-        // Admin: get all requests
-        const requests = await getAllRequests(null, params.status);
-        reportData = { type: 'all_requests', data: requests };
-      } else if (access.level === 'team') {
-        // Manager: get team requests
-        const teamMembers = await getTeamMembers(userId);
-        const teamIds = [userId, ...teamMembers.map(m => m.userId)];
-        const requests = await getAllRequests(teamIds, params.status);
-        reportData = { type: 'team_requests', data: requests };
-      } else {
-        // Employee: get own requests
-        const requests = await getAllRequests(userId, params.status);
-        reportData = { type: 'personal_requests', data: requests };
-      }
-      break;
-      
-    case 'upcoming':
-      const today = new Date();
-      const endDate = new Date();
-      endDate.setDate(today.getDate() + (params.days || 7));
-      
-      let requests;
-      if (access.level === 'all') {
-        requests = await getAllRequests(null, 'approved');
-      } else if (access.level === 'team') {
-        const teamMembers = await getTeamMembers(userId);
-        const teamIds = [userId, ...teamMembers.map(m => m.userId)];
-        requests = await getAllRequests(teamIds, 'approved');
-      } else {
-        requests = await getAllRequests(userId, 'approved');
-      }
-      
-      // Filter to upcoming dates
-      const upcoming = requests.filter(r => {
-        const start = new Date(r.start);
-        const end = new Date(r.end);
-        return (start <= endDate && end >= today);
-      });
-      
-      reportData = { type: 'upcoming_pto', data: upcoming };
-      break;
-  }
-  
-  return {
-    success: true,
-    access: access.level,
-    reportData
-  };
 }
 
-async function getAllUsers() {
-  log.info("Getting all users from Teams sheet");
-  
+// Get user's PTO history from the sheet
+async function getUserPTOHistory(userId) {
   try {
     const client = await auth.getClient();
     const result = await sheets.spreadsheets.values.get({
       auth: client,
       spreadsheetId,
-      range: "Teams!A2:E1000"
+      range: "PTO_Requests!A2:K1000"
     });
     
     const rows = result.data.values || [];
-    const users = rows.map(r => ({
-      name: r[0],
-      userId: r[1],
-      team: r[2],
-      managerId: r[3],
-      role: r[4] || 'Employee'
-    }));
+    const userRequests = rows.filter(r => r[1] === userId && r[7] === "approved");
     
-    log.info("All users retrieved", { userCount: users.length });
-    return users;
+    // Calculate stats
+    const totalRequests = userRequests.length;
+    let lastRequestDate = null;
+    let totalDaysUsed = 0;
+    
+    if (totalRequests > 0) {
+      // Find most recent approved request
+      const sortedRequests = userRequests.sort((a, b) => new Date(b[0]) - new Date(a[0]));
+      lastRequestDate = sortedRequests[0][0];
+      
+      // Sum up total days used
+      totalDaysUsed = userRequests.reduce((sum, req) => sum + (parseInt(req[5]) || 0), 0);
+    }
+    
+    // Calculate average frequency (requests per month over the last year)
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+    const recentRequests = userRequests.filter(r => new Date(r[0]) > oneYearAgo);
+    const avgFrequency = recentRequests.length / 12;
+    
+    return {
+      totalRequests,
+      lastRequestDate,
+      totalDaysUsed,
+      avgRequestsPerMonth: avgFrequency.toFixed(1),
+      daysRemaining: 25 - totalDaysUsed // Assuming 25 days annual allowance
+    };
   } catch (error) {
-    log.error("Failed to get all users", { error: error.message });
-    return [];
+    log.error("Failed to get user PTO history", { userId, error: error.message });
+    return {
+      totalRequests: 0,
+      lastRequestDate: null,
+      totalDaysUsed: 0,
+      avgRequestsPerMonth: 0,
+      daysRemaining: 25
+    };
   }
 }
 
-async function parseReportQuery(text) {
-  log.info("Parsing report query with OpenRouter", { inputText: text });
+// Parse PTO request from natural language
+async function parsePTORequest(text) {
+  const prompt = `Extract PTO request details from: "${text}"
   
-  // Check for explicit personal indicators first
-  const personalIndicators = ['my', 'mine', 'me', 'self', 'personal', 'i have', "i've"];
-  const teamIndicators = ['team', 'direct reports', 'my team', 'my reports'];
-  const allIndicators = ['all', 'everyone', 'company', 'entire', 'whole'];
-  
-  const lowerText = text.toLowerCase();
-  
-  // Determine scope based on explicit indicators
-  let inferredScope = 'self'; // Default to self
-  if (personalIndicators.some(indicator => lowerText.includes(indicator))) {
-    inferredScope = 'self';
-  } else if (allIndicators.some(indicator => lowerText.includes(indicator))) {
-    inferredScope = 'all';
-  } else if (teamIndicators.some(indicator => lowerText.includes(indicator))) {
-    inferredScope = 'team';
-  }
-  
-  const prompt = `Extract report request info from: "${text}". 
-Identify the report type and parameters.
-Types: balance, requests, upcoming, summary
-Scope: self, team, all
-Status: pending, approved, denied, all
+Return a JSON object with:
+- start: YYYY-MM-DD format
+- end: YYYY-MM-DD format  
+- reason: brief description
 
-IMPORTANT: The default scope should be "${inferredScope}" based on the query.
-
-Return JSON like:
-{
-  "type": "balance|requests|upcoming|summary",
-  "scope": "self|team|all",
-  "status": "pending|approved|denied|all",
-  "days": 7,
-  "format": "simple|detailed"
-}
+If only one date mentioned, use it for both start and end.
+Today's date is ${new Date().toISOString().split('T')[0]}.
 
 Examples:
-"my balance" -> {"type":"balance","scope":"self"}
-"balance" -> {"type":"balance","scope":"self"}
-"" (empty) -> {"type":"balance","scope":"self"}
-"team requests" -> {"type":"requests","scope":"team","status":"all"}
-"all employee balances" -> {"type":"balance","scope":"all"}
-"show me everyone's balance" -> {"type":"balance","scope":"all"}`;
-  
-  const requestBody = {
-    model: "openai/gpt-3.5-turbo",
-    messages: [{ role: "user", content: prompt }]
-  };
-  
+"next Monday to Friday for vacation" -> parse the actual dates
+"December 25-27 for holidays" -> parse the actual dates
+"tomorrow for a doctor appointment" -> parse tomorrow's date for both start and end
+
+Return ONLY valid JSON, no other text.`;
+
   try {
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -455,696 +190,403 @@ Examples:
         "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify({
+        model: "openai/gpt-3.5-turbo",
+        messages: [{ role: "user", content: prompt }]
+      })
     });
     
     const data = await res.json();
     const parsed = JSON.parse(data.choices[0].message.content.trim());
     
-    // Override with our inferred scope if not explicitly set differently
-    if (!text.toLowerCase().includes('all') && !text.toLowerCase().includes('everyone') && 
-        !text.toLowerCase().includes('team') && !text.toLowerCase().includes('reports')) {
-      parsed.scope = 'self';
-    }
-    
-    log.info("Report query parsed successfully", { 
-      inputText: text,
-      inferredScope,
-      parsed 
-    });
     return parsed;
   } catch (error) {
-    log.error("Failed to parse report query", { error: error.message });
-    // Default fallback - always default to personal/self scope
-    return {
-      type: 'balance',
-      scope: 'self',  // Changed from 'self' to ensure personal by default
-      status: 'all',
-      format: 'simple'
-    };
+    log.error("Failed to parse PTO request", { text, error: error.message });
+    throw new Error("Could not understand the date request. Please try again with specific dates.");
   }
 }
 
-async function formatReportWithLLM(reportData, format = 'simple') {
-  log.info("Formatting report with LLM", { 
-    reportType: reportData.type,
-    dataCount: reportData.data?.length || 1
-  });
-  
-  let prompt = `Format this PTO data into a clear, readable Slack message with appropriate emojis and formatting.\n\nData: ${JSON.stringify(reportData)}\n\n`;
-  
-  if (format === 'simple') {
-    prompt += "Keep it concise with key information only. Use bullet points and bold for emphasis.";
-  } else {
-    prompt += "Provide a detailed report with insights and summaries. Include totals and patterns if relevant.";
-  }
-  
-  const requestBody = {
-    model: "openai/gpt-3.5-turbo",
-    messages: [{ role: "user", content: prompt }]
-  };
-  
-  try {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(requestBody)
-    });
-    
-    const data = await res.json();
-    return data.choices[0].message.content.trim();
-  } catch (error) {
-    log.error("Failed to format report with LLM", { error: error.message });
-    // Fallback to simple formatting
-    return formatReportFallback(reportData);
-  }
-}
-
-function formatReportFallback(reportData) {
-  let message = "📊 *PTO Report*\n\n";
-  
-  switch (reportData.type) {
-    case 'personal_balance':
-      const b = reportData.data.balance;
-      message += `*Your PTO Balance:*\n`;
-      message += `• Annual allowance: ${b.allowance} days\n`;
-      message += `• Used: ${b.taken} days\n`;
-      message += `• Remaining: ${b.remaining} days\n`;
-      break;
-      
-    case 'team_balances':
-    case 'all_balances':
-      message += `*PTO Balances:*\n`;
-      reportData.data.forEach(user => {
-        message += `\n*${user.name}* (${user.team})\n`;
-        message += `• Remaining: ${user.balance.remaining}/${user.balance.allowance} days\n`;
-      });
-      break;
-      
-    case 'personal_requests':
-    case 'team_requests':
-    case 'all_requests':
-      message += `*PTO Requests:*\n`;
-      if (reportData.data.length === 0) {
-        message += "No requests found.\n";
-      } else {
-        reportData.data.forEach(req => {
-          message += `\n• ${req.start} to ${req.end}\n`;
-          message += `  User: <@${req.userId}> | Status: ${req.status}\n`;
-        });
-      }
-      break;
-      
-    case 'upcoming_pto':
-      message += `*Upcoming PTO:*\n`;
-      if (reportData.data.length === 0) {
-        message += "No one is scheduled out.\n";
-      } else {
-        reportData.data.forEach(req => {
-          message += `\n• <@${req.userId}>: ${req.start} to ${req.end}\n`;
-          message += `  Reason: ${req.reason}\n`;
-        });
-      }
-      break;
-  }
-  
-  return message;
-}
-
-async function getBalance(userId) {
-  // Skip invalid user IDs
-  if (!userId || userId === "#N/A" || userId.trim() === "") {
-    log.debug("Skipping invalid userId", { userId });
-    return { allowance: 0, taken: 0, remaining: 0 };
-  }
-  
-  log.info("Getting balance from Google Sheets", { userId, spreadsheetId });
-  
+// Log request to Google Sheets
+async function logRequest(requestData) {
   try {
     const client = await auth.getClient();
-    log.debug("Google Auth client obtained successfully");
     
-    const requestParams = {
+    const values = [[
+      new Date().toISOString(),           // timestamp
+      requestData.userId,                  // user_id
+      requestData.userName,                 // user_name
+      requestData.start,                    // start_date
+      requestData.end,                      // end_date
+      requestData.businessDays,             // vacation_length
+      requestData.reason,                   // reason
+      requestData.status,                   // status
+      requestData.managerId,                // manager_id
+      requestData.managerName               // manager_name
+    ]];
+    
+    const result = await sheets.spreadsheets.values.append({
       auth: client,
       spreadsheetId,
-      range: "Balances!A2:C1000"
-    };
-    log.debug("Sheets API request params", requestParams);
-    
-    const result = await sheets.spreadsheets.values.get(requestParams);
-    log.info("Google Sheets response received", {
-      userId,
-      rowCount: result.data.values?.length || 0,
-      range: result.data.range
+      range: "PTO_Requests!A2:J2",
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values }
     });
     
-    const row = result.data.values?.find(r => r[0] === userId);
-    
-    if (!row) {
-      log.debug("User not found in balance sheet, returning default", { userId });
-      return { allowance: 0, taken: 0, remaining: 0 };
-    }
-    
-    const [ , allowance, taken ] = row.map(Number);
-    const balance = { allowance, taken, remaining: allowance - taken };
-    log.info("Balance retrieved successfully", { userId, balance });
-    
-    return balance;
+    log.info("Request logged to Google Sheets", { requestData });
+    return result;
   } catch (error) {
-    log.error("Failed to get balance from Google Sheets", {
-      userId,
-      error: error.message,
-      stack: error.stack
-    });
+    log.error("Failed to log request", { error: error.message });
     throw error;
   }
 }
 
-// New optimized function to get all balances at once
-async function getAllBalances(userIds) {
-  log.info("Getting all balances in batch", { userCount: userIds.length });
-  
+// Update request status in Google Sheets
+async function updateRequestStatus(userId, start, end, newStatus, approverId) {
   try {
     const client = await auth.getClient();
+    
+    // Get all requests
     const result = await sheets.spreadsheets.values.get({
       auth: client,
       spreadsheetId,
-      range: "Balances!A2:C1000"
+      range: "PTO_Requests!A2:J1000"
     });
     
-    const balanceMap = {};
     const rows = result.data.values || [];
-    
-    // Create a map for quick lookup
-    rows.forEach(row => {
-      if (row[0]) {
-        const [userId, allowance, taken] = row;
-        balanceMap[userId] = {
-          allowance: Number(allowance) || 0,
-          taken: Number(taken) || 0,
-          remaining: (Number(allowance) || 0) - (Number(taken) || 0)
-        };
-      }
-    });
-    
-    // Return balances for requested users
-    const balances = {};
-    userIds.forEach(userId => {
-      if (userId && userId !== "#N/A") {
-        balances[userId] = balanceMap[userId] || { allowance: 0, taken: 0, remaining: 0 };
-      }
-    });
-    
-    log.info("Batch balance retrieval complete", { 
-      requestedCount: userIds.length,
-      foundCount: Object.keys(balanceMap).length 
-    });
-    
-    return balances;
-  } catch (error) {
-    log.error("Failed to get batch balances", { error: error.message });
-    throw error;
-  }
-}
-
-async function logRequest(obj) {
-  log.info("Logging PTO request to Google Sheets", obj);
-  
-  try {
-    const client = await auth.getClient();
-    log.debug("Google Auth client obtained for request logging");
-    
-    const requestData = {
-      auth: client,
-      spreadsheetId,
-      range: "Requests!A2:G2",
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [[
-          new Date().toISOString(),
-          obj.user,
-          obj.start,
-          obj.end,
-          obj.reason,
-          "pending",
-          obj.manager
-        ]]
-      }
-    };
-    
-    log.debug("Sheets append request data", requestData);
-    
-    const result = await sheets.spreadsheets.values.append(requestData);
-    
-    log.info("PTO request logged successfully", {
-      user: obj.user,
-      updatedRange: result.data.updates?.updatedRange,
-      updatedRows: result.data.updates?.updatedRows,
-      updatedColumns: result.data.updates?.updatedColumns
-    });
-    
-    return result;
-  } catch (error) {
-    log.error("Failed to log request to Google Sheets", {
-      requestData: obj,
-      error: error.message,
-      stack: error.stack
-    });
-    throw error;
-  }
-}
-
-async function updateRequestStatus(userId, start, end, status) {
-  log.info("Updating request status in Google Sheets", { userId, start, end, status });
-  
-  try {
-    const client = await auth.getClient();
-    
-    // First, get all requests to find the matching one
-    const getResult = await sheets.spreadsheets.values.get({
-      auth: client,
-      spreadsheetId,
-      range: "Requests!A2:G1000"
-    });
-    
-    const rows = getResult.data.values || [];
     const rowIndex = rows.findIndex(r => 
       r[1] === userId && 
-      r[2] === start && 
-      r[3] === end && 
-      r[5] === "pending"
+      r[3] === start && 
+      r[4] === end && 
+      r[7] === "pending"
     );
     
     if (rowIndex === -1) {
-      log.warn("No matching pending request found", { userId, start, end });
-      return;
+      log.error("No matching pending request found", { userId, start, end });
+      return false;
     }
     
-    // Update the status column (F) for the found row
-    const updateRange = `Requests!F${rowIndex + 2}`; // +2 because we start from row 2
-    
+    // Update status column (H = column 8)
     await sheets.spreadsheets.values.update({
       auth: client,
       spreadsheetId,
-      range: updateRange,
+      range: `PTO_Requests!H${rowIndex + 2}`,
       valueInputOption: "USER_ENTERED",
       requestBody: {
-        values: [[status]]
+        values: [[newStatus]]
       }
     });
     
-    log.info("Request status updated successfully", { userId, status, range: updateRange });
-    
-    // If approved, update the balance
-    if (status === "approved") {
-      await updateBalance(userId, start, end);
-    }
-    
+    log.info("Request status updated", { userId, start, end, newStatus });
+    return true;
   } catch (error) {
-    log.error("Failed to update request status", {
-      userId,
-      status,
-      error: error.message,
-      stack: error.stack
-    });
-    throw error;
+    log.error("Failed to update request status", { error: error.message });
+    return false;
   }
 }
 
-async function updateBalance(userId, start, end) {
-  log.info("Updating user balance after approval", { userId, start, end });
-  
-  try {
-    const client = await auth.getClient();
-    
-    // Calculate days taken (simplified - counting weekdays would be better)
-    const startDate = new Date(start);
-    const endDate = new Date(end);
-    const daysTaken = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
-    
-    log.info("Days calculated for PTO", { start, end, daysTaken });
-    
-    // Get current balance
-    const balanceResult = await sheets.spreadsheets.values.get({
-      auth: client,
-      spreadsheetId,
-      range: "Balances!A2:C1000"
-    });
-    
-    const rows = balanceResult.data.values || [];
-    const rowIndex = rows.findIndex(r => r[0] === userId);
-    
-    if (rowIndex === -1) {
-      log.error("User not found in Balances sheet for update", { userId });
-      throw new Error(`User ${userId} not found in Balances sheet`);
-    }
-    
-    const currentTaken = Number(rows[rowIndex][2]) || 0;
-    const newTaken = currentTaken + daysTaken;
-    
-    // Update the taken_so_far column (C)
-    const updateRange = `Balances!C${rowIndex + 2}`; // +2 because we start from row 2
-    
-    log.info("Updating balance in sheet", { 
-      userId,
-      updateRange,
-      currentTaken,
-      daysTaken,
-      newTaken
-    });
-    
-    const updateResult = await sheets.spreadsheets.values.update({
-      auth: client,
-      spreadsheetId,
-      range: updateRange,
-      valueInputOption: "USER_ENTERED",
-      requestBody: {
-        values: [[newTaken]]
-      }
-    });
-    
-    log.info("Balance updated successfully", { 
-      userId, 
-      daysTaken, 
-      previousBalance: currentTaken,
-      newBalance: newTaken,
-      updatedCells: updateResult.data.updatedCells,
-      updatedRange: updateResult.data.updatedRange
-    });
-    
-    return { daysTaken, previousBalance: currentTaken, newBalance: newTaken };
-    
-  } catch (error) {
-    log.error("Failed to update balance", {
-      userId,
-      error: error.message,
-      stack: error.stack
-    });
-    // Don't throw - we want the approval to succeed even if balance update fails
-    // The error is logged and can be fixed manually
-    return null;
-  }
+// Get manager ID (simplified - you might want to use a lookup table)
+function getManagerId(userId) {
+  // For now, use the HR_SLACK_ID as the default manager
+  // In production, you'd look this up from a Teams sheet or Slack workspace
+  return process.env.HR_SLACK_ID || "U07T2QXUZPL";
 }
 
-async function parsePto(text) {
-  log.info("Parsing PTO request with OpenRouter", { inputText: text });
-  
-  const prompt = `Extract PTO info from: "${text}". 
-Return JSON like {"start":"YYYY-MM-DD","end":"YYYY-MM-DD","reason":"..."}.
-If only one date, use it for both start and end.
-If no specific dates are mentioned, use tomorrow as start and 3 days later as end.
-Today's date is ${new Date().toISOString().split('T')[0]}.
-Always return actual dates, never placeholders like "YYYY-MM-DD".`;
-  
-  const requestBody = {
-    model: "openai/gpt-3.5-turbo",
-    messages: [{ role: "user", content: prompt }]
-  };
-  
-  log.debug("OpenRouter API request", {
-    url: "https://openrouter.ai/api/v1/chat/completions",
-    model: requestBody.model,
-    promptLength: prompt.length
-  });
-  
-  try {
-    const startTime = Date.now();
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(requestBody)
-    });
-    
-    const responseTime = Date.now() - startTime;
-    log.info("OpenRouter API response received", {
-      status: res.status,
-      statusText: res.statusText,
-      responseTimeMs: responseTime
-    });
-    
-    if (!res.ok) {
-      const errorText = await res.text();
-      log.error("OpenRouter API error response", {
-        status: res.status,
-        errorText
-      });
-      throw new Error(`OpenRouter API error: ${res.status} - ${errorText}`);
-    }
-    
-    const data = await res.json();
-    log.debug("OpenRouter raw response", data);
-    
-    const parsedContent = JSON.parse(data.choices[0].message.content.trim());
-    
-    // Validate the parsed dates
-    if (parsedContent.start === "YYYY-MM-DD" || parsedContent.end === "YYYY-MM-DD") {
-      log.warn("LLM returned placeholder dates, using defaults", { parsedContent });
-      
-      // Default to next Monday for a week if no dates specified
-      const today = new Date();
-      const daysUntilMonday = (8 - today.getDay()) % 7 || 7;
-      const nextMonday = new Date(today);
-      nextMonday.setDate(today.getDate() + daysUntilMonday);
-      const nextFriday = new Date(nextMonday);
-      nextFriday.setDate(nextMonday.getDate() + 4);
-      
-      parsedContent.start = nextMonday.toISOString().split('T')[0];
-      parsedContent.end = nextFriday.toISOString().split('T')[0];
-      parsedContent.reason = parsedContent.reason || "vacation";
-    }
-    
-    log.info("PTO parsing successful", {
-      inputText: text,
-      parsedResult: parsedContent
-    });
-    
-    return parsedContent;
-  } catch (error) {
-    log.error("Failed to parse PTO request", {
-      inputText: text,
-      error: error.message,
-      stack: error.stack
-    });
-    throw error;
-  }
-}
+// --- Main Slack Event Handlers ---
 
-// --- Slack Commands & Listeners ---
-app.command("/pto", async ({ ack, body, client }) => {
-  await ack();
-  const userId = body.user_id;
-  const commandText = body.text;
+// Handle DM messages to the bot
+app.message(async ({ message, client, say }) => {
+  // Only respond to DMs, not channel messages
+  if (message.channel_type !== 'im') return;
   
-  log.info("PTO command received", {
-    userId,
-    userName: body.user_name,
-    commandText,
-    channelId: body.channel_id,
-    teamId: body.team_id
-  });
+  // Don't respond to bot messages
+  if (message.bot_id) return;
+  
+  const userId = message.user;
+  const text = message.text;
+  
+  log.info("DM received", { userId, text });
   
   try {
-    const parsed = await parsePto(commandText);
-    log.info("PTO text parsed successfully", { userId, parsed });
+    // Get user info
+    const userInfo = await getUserInfo(userId);
     
-    const bal = await getBalance(userId);
-    log.info("User balance retrieved", { userId, balance: bal });
+    // Parse the PTO request
+    const ptoRequest = await parsePTORequest(text);
     
-    if (bal.remaining <= 0) {
-      log.warn("User has insufficient PTO balance", { userId, balance: bal });
-      
-      await client.chat.postMessage({
-        channel: userId,
-        text: `You're out of PTO (used ${bal.taken}/${bal.allowance}).`
-      });
-      log.info("Insufficient balance message sent to user", { userId });
+    // Calculate business days
+    const businessDays = calculateBusinessDays(ptoRequest.start, ptoRequest.end);
+    
+    // Get user's PTO history
+    const history = await getUserPTOHistory(userId);
+    
+    // Check if user has enough days
+    if (businessDays > history.daysRemaining) {
+      await say(`❌ Sorry, you're requesting ${businessDays} days but only have ${history.daysRemaining} days remaining in your balance.`);
       return;
     }
     
-    const confirmationMessage = {
-      channel: userId,
-      text: `Requesting ${parsed.start} → ${parsed.end} for *${parsed.reason}*.\nReply "yes" to confirm.`,
-      metadata: { event_type: "awaiting_confirmation", event_payload: { ...parsed } }
-    };
-    
-    log.debug("Sending confirmation message", confirmationMessage);
-    
-    await client.chat.postMessage(confirmationMessage);
-    log.info("Confirmation request sent to user", {
-      userId,
-      ptoRequest: parsed
-    });
-  } catch (error) {
-    log.error("Error processing PTO command", {
-      userId,
-      commandText,
-      error: error.message,
-      stack: error.stack
-    });
-    
-    await client.chat.postMessage({
-      channel: userId,
-      text: "Sorry, there was an error processing your request. Please try again."
-    });
-  }
-});
-
-app.message(/^yes$/i, async ({ message, client }) => {
-  log.debug("Message received", {
-    user: message.user,
-    text: message.text,
-    hasMetadata: !!message.metadata,
-    metadata: message.metadata
-  });
-  
-  if (!message.metadata || message.metadata.event_type !== "awaiting_confirmation") {
-    log.debug("Message ignored - not a confirmation", {
-      user: message.user,
-      metadataType: message.metadata?.event_type
-    });
-    return;
-  }
-  
-  const { start, end, reason } = message.metadata.event_payload;
-  const user = message.user;
-  const manager = process.env.HR_SLACK_ID;
-  
-  log.info("PTO confirmation received", {
-    user,
-    start,
-    end,
-    reason,
-    manager
-  });
-  
-  try {
-    await logRequest({ user, start, end, reason, manager });
-    log.info("Request logged to sheets successfully", { user });
-    
-    const managerMessage = {
-      channel: manager,
-      text: `PTO request from <@${user}>`,
+    // Send confirmation message
+    await say({
+      text: `Please confirm your PTO request:`,
       blocks: [
-        { type: "section",
-          text: { type: "mrkdwn", text: `*PTO Request*\nUser: <@${user}>\n${start} → ${end}\nReason: ${reason}` } },
-        { type: "actions",
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*Please confirm your PTO request:*\n\n` +
+                  `📅 *Dates:* ${ptoRequest.start} to ${ptoRequest.end}\n` +
+                  `📊 *Business days:* ${businessDays} days (excluding weekends)\n` +
+                  `📝 *Reason:* ${ptoRequest.reason}\n` +
+                  `💰 *Your balance after approval:* ${history.daysRemaining - businessDays} days remaining`
+          }
+        },
+        {
+          type: "actions",
           elements: [
-            { type: "button", style: "primary", text: { type: "plain_text", text: "Approve" },
-              value: JSON.stringify({ user, start, end }), action_id: "approve" },
-            { type: "button", style: "danger", text: { type: "plain_text", text: "Deny" },
-              value: JSON.stringify({ user }), action_id: "deny" }
-          ] }
+            {
+              type: "button",
+              text: {
+                type: "plain_text",
+                text: "✅ Confirm Request"
+              },
+              style: "primary",
+              action_id: "confirm_pto",
+              value: JSON.stringify({
+                userId,
+                userName: userInfo.name,
+                start: ptoRequest.start,
+                end: ptoRequest.end,
+                businessDays,
+                reason: ptoRequest.reason,
+                history
+              })
+            },
+            {
+              type: "button",
+              text: {
+                type: "plain_text",
+                text: "❌ Cancel"
+              },
+              style: "danger",
+              action_id: "cancel_pto"
+            }
+          ]
+        }
       ]
-    };
-    
-    log.debug("Sending approval request to manager", {
-      manager,
-      requestDetails: { user, start, end, reason }
     });
     
-    await client.chat.postMessage(managerMessage);
-    log.info("Approval request sent to manager", { user, manager });
-    
-    await client.chat.postMessage({ channel: user, text: "Request sent for approval. 🎉" });
-    log.info("Confirmation sent to user", { user });
   } catch (error) {
-    log.error("Error processing PTO confirmation", {
-      user,
-      error: error.message,
-      stack: error.stack
+    log.error("Error processing PTO request", { error: error.message });
+    await say(`❌ Sorry, I couldn't understand your request. Please try again with a format like:\n"I need next Monday to Friday off for vacation"`);
+  }
+});
+
+// Handle PTO confirmation
+app.action("confirm_pto", async ({ ack, body, client }) => {
+  await ack();
+  
+  const requestData = JSON.parse(body.actions[0].value);
+  const managerId = getManagerId(requestData.userId);
+  const managerInfo = await getUserInfo(managerId);
+  
+  try {
+    // Log the request as pending
+    await logRequest({
+      ...requestData,
+      status: "pending",
+      managerId: managerId,
+      managerName: managerInfo.name
     });
+    
+    // Calculate context for manager
+    const daysSinceLastRequest = requestData.history.lastRequestDate 
+      ? Math.floor((new Date() - new Date(requestData.history.lastRequestDate)) / (1000 * 60 * 60 * 24))
+      : "N/A (first request)";
+    
+    // Send to manager for approval
+    await client.chat.postMessage({
+      channel: managerId,
+      text: `New PTO request from ${requestData.userName}`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `*New PTO Request*\n\n` +
+                  `👤 *Employee:* ${requestData.userName} (<@${requestData.userId}>)\n` +
+                  `📅 *Dates:* ${requestData.start} to ${requestData.end}\n` +
+                  `📊 *Business days:* ${requestData.businessDays} days\n` +
+                  `📝 *Reason:* ${requestData.reason}\n\n` +
+                  `*Context:*\n` +
+                  `• Current balance: ${requestData.history.daysRemaining} days\n` +
+                  `• After approval: ${requestData.history.daysRemaining - requestData.businessDays} days\n` +
+                  `• Days since last request: ${daysSinceLastRequest}\n` +
+                  `• Average requests/month: ${requestData.history.avgRequestsPerMonth}\n` +
+                  `• Total days used this year: ${requestData.history.totalDaysUsed}`
+          }
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: {
+                type: "plain_text",
+                text: "✅ Approve"
+              },
+              style: "primary",
+              action_id: "approve_pto",
+              value: JSON.stringify({
+                userId: requestData.userId,
+                userName: requestData.userName,
+                start: requestData.start,
+                end: requestData.end,
+                businessDays: requestData.businessDays
+              })
+            },
+            {
+              type: "button",
+              text: {
+                type: "plain_text",
+                text: "❌ Deny"
+              },
+              style: "danger",
+              action_id: "deny_pto",
+              value: JSON.stringify({
+                userId: requestData.userId,
+                userName: requestData.userName,
+                start: requestData.start,
+                end: requestData.end
+              })
+            }
+          ]
+        }
+      ]
+    });
+    
+    // Update the user's message
+    await client.chat.update({
+      channel: body.channel.id,
+      ts: body.message.ts,
+      text: "✅ Your PTO request has been submitted for approval. You'll be notified once your manager reviews it.",
+      blocks: []
+    });
+    
+  } catch (error) {
+    log.error("Error submitting PTO request", { error: error.message });
     
     await client.chat.postMessage({
-      channel: user,
-      text: "Sorry, there was an error submitting your request. Please try again."
+      channel: requestData.userId,
+      text: "❌ Sorry, there was an error submitting your request. Please try again."
     });
   }
 });
 
-app.action("approve", async ({ ack, body, client }) => {
+// Handle PTO cancellation
+app.action("cancel_pto", async ({ ack, body, client }) => {
   await ack();
-  const actionValue = JSON.parse(body.actions[0].value);
-  const { user, start, end } = actionValue;
-  const approver = body.user.id;
   
-  log.info("PTO approval action received", {
-    approver,
-    approverName: body.user.name,
-    user,
-    start,
-    end
+  await client.chat.update({
+    channel: body.channel.id,
+    ts: body.message.ts,
+    text: "❌ PTO request cancelled.",
+    blocks: []
   });
+});
+
+// Handle PTO approval
+app.action("approve_pto", async ({ ack, body, client }) => {
+  await ack();
+  
+  const requestData = JSON.parse(body.actions[0].value);
+  const approverId = body.user.id;
   
   try {
-    await client.chat.postMessage({ 
-      channel: user, 
-      text: `✅ Approved! Enjoy ${start} → ${end}` 
-    });
-    log.info("Approval notification sent to user", { user });
+    // Update status in Google Sheets
+    const updated = await updateRequestStatus(
+      requestData.userId,
+      requestData.start,
+      requestData.end,
+      "approved",
+      approverId
+    );
     
-    await client.chat.update({ 
-      channel: body.channel.id, 
-      ts: body.message.ts, 
-      text: "Approved ✔️", 
-      blocks: [] 
+    if (!updated) {
+      throw new Error("Could not find the request to update");
+    }
+    
+    // Notify the employee
+    await client.chat.postMessage({
+      channel: requestData.userId,
+      text: `✅ Good news! Your PTO request has been approved!\n\n` +
+            `📅 *Dates:* ${requestData.start} to ${requestData.end}\n` +
+            `📊 *Business days:* ${requestData.businessDays} days\n` +
+            `✅ *Approved by:* <@${approverId}>\n\n` +
+            `Enjoy your time off! 🎉`
     });
-    log.info("Manager message updated with approval", {
-      approver,
-      user,
-      channelId: body.channel.id
+    
+    // Update the manager's message
+    await client.chat.update({
+      channel: body.channel.id,
+      ts: body.message.ts,
+      text: `✅ PTO request for ${requestData.userName} has been approved.`,
+      blocks: []
     });
+    
   } catch (error) {
-    log.error("Error processing approval", {
-      approver,
-      user,
-      error: error.message,
-      stack: error.stack
+    log.error("Error approving PTO request", { error: error.message });
+    
+    await client.chat.postMessage({
+      channel: approverId,
+      text: "❌ There was an error processing the approval. Please check the Google Sheet directly."
     });
   }
 });
 
-app.action("deny", async ({ ack, body, client }) => {
+// Handle PTO denial
+app.action("deny_pto", async ({ ack, body, client }) => {
   await ack();
-  const actionValue = JSON.parse(body.actions[0].value);
-  const { user } = actionValue;
-  const denier = body.user.id;
   
-  log.info("PTO denial action received", {
-    denier,
-    denierName: body.user.name,
-    user
-  });
+  const requestData = JSON.parse(body.actions[0].value);
+  const denierId = body.user.id;
   
   try {
-    await client.chat.postMessage({ 
-      channel: user, 
-      text: `❌ Sorry, your PTO request was denied.` 
-    });
-    log.info("Denial notification sent to user", { user });
+    // Update status in Google Sheets
+    const updated = await updateRequestStatus(
+      requestData.userId,
+      requestData.start,
+      requestData.end,
+      "denied",
+      denierId
+    );
     
-    await client.chat.update({ 
-      channel: body.channel.id, 
-      ts: body.message.ts, 
-      text: "Denied ✖️", 
-      blocks: [] 
+    if (!updated) {
+      throw new Error("Could not find the request to update");
+    }
+    
+    // Notify the employee
+    await client.chat.postMessage({
+      channel: requestData.userId,
+      text: `❌ Your PTO request has been denied.\n\n` +
+            `📅 *Dates:* ${requestData.start} to ${requestData.end}\n` +
+            `❌ *Denied by:* <@${denierId}>\n\n` +
+            `Please speak with your manager if you have questions.`
     });
-    log.info("Manager message updated with denial", {
-      denier,
-      user,
-      channelId: body.channel.id
+    
+    // Update the manager's message
+    await client.chat.update({
+      channel: body.channel.id,
+      ts: body.message.ts,
+      text: `❌ PTO request for ${requestData.userName} has been denied.`,
+      blocks: []
     });
+    
   } catch (error) {
-    log.error("Error processing denial", {
-      denier,
-      user,
-      error: error.message,
-      stack: error.stack
+    log.error("Error denying PTO request", { error: error.message });
+    
+    await client.chat.postMessage({
+      channel: denierId,
+      text: "❌ There was an error processing the denial. Please check the Google Sheet directly."
     });
   }
 });
@@ -1158,10 +600,6 @@ export default async function handler(req, res) {
   });
   
   if (req.method !== "POST") {
-    log.warn("Non-POST request received", {
-      method: req.method,
-      url: req.url
-    });
     res.statusCode = 404;
     return res.end("Not found");
   }
@@ -1173,26 +611,18 @@ export default async function handler(req, res) {
   }
   const rawBody = Buffer.concat(chunks).toString();
   
-  log.debug("Request body received", {
-    bodyLength: rawBody.length,
-    bodyPreview: rawBody.substring(0, 200)
-  });
-  
-  // Check for Slack URL verification (special case)
+  // Check for Slack URL verification
   const contentType = req.headers["content-type"] || "";
   if (contentType.includes("application/json")) {
     try {
       const payload = JSON.parse(rawBody);
       if (payload.type === "url_verification" && payload.challenge) {
-        log.info("Slack URL verification challenge received", {
-          challenge: payload.challenge
-        });
         res.statusCode = 200;
         res.setHeader("Content-Type", "text/plain");
         return res.end(payload.challenge);
       }
     } catch (e) {
-      log.debug("Not a URL verification request", { error: e.message });
+      // Not a verification request
     }
   }
   
@@ -1201,508 +631,49 @@ export default async function handler(req, res) {
   const timestamp = req.headers["x-slack-request-timestamp"];
   
   if (!signature || !timestamp) {
-    log.error("Missing Slack signature or timestamp", {
-      hasSignature: !!signature,
-      hasTimestamp: !!timestamp
-    });
     res.statusCode = 400;
     return res.end("Bad request");
   }
   
   const isValid = await receiver.verifySignature(rawBody, signature, timestamp);
   if (!isValid) {
-    log.error("Invalid Slack signature");
     res.statusCode = 401;
     return res.end("Unauthorized");
   }
   
-  log.info("Slack signature verified successfully");
-  
+  // Process the request
   try {
-    // Parse the request based on content type
     let body;
+    
     if (contentType.includes("application/x-www-form-urlencoded")) {
       body = receiver.parseUrlEncoded(rawBody);
-      log.debug("Parsed URL-encoded body", {
-        command: body.command,
-        userId: body.user_id,
-        text: body.text,
-        hasPayload: !!body.payload
-      });
       
-      // Check if this is an interactive component (has payload)
+      // Handle interactive payloads (button clicks)
       if (body.payload) {
-        log.info("Processing interactive payload");
         const payload = JSON.parse(body.payload);
-        log.debug("Parsed interactive payload", {
-          type: payload.type,
-          actions: payload.actions?.map(a => a.action_id)
-        });
+        const eventName = payload.actions?.[0]?.action_id;
         
-        // Handle block actions (button clicks)
-        if (payload.type === "block_actions") {
-          const actionId = payload.actions?.[0]?.action_id;
-          const actionValue = JSON.parse(payload.actions[0].value);
-          
-          log.info(`Processing ${actionId} action from interactive payload`);
-          
-          if (actionId === "approve") {
-            const { user, start, end } = actionValue;
-            const approver = payload.user.id;
-            
-            log.info("PTO approval action received", {
-              approver,
-              approverName: payload.user.name,
-              user,
-              start,
-              end
-            });
-            
-            try {
-              // Update the request status in Google Sheets
-              await updateRequestStatus(user, start, end, "approved");
-              log.info("Request status updated to approved in Sheets", { user });
-              
-              // Calculate days for the message
-              const startDate = new Date(start);
-              const endDate = new Date(end);
-              const daysApproved = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
-              
-              // Notify the employee
-              await app.client.chat.postMessage({ 
-                channel: user, 
-                text: `🎉 *Great news! Your PTO request has been approved!*\n\n*Approved dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n\nEnjoy your time off! Your PTO balance has been updated.` 
-              });
-              log.info("Approval notification sent to user", { user });
-              
-              // Update the manager's message
-              await app.client.chat.update({ 
-                channel: payload.channel.id, 
-                ts: payload.message.ts, 
-                text: `✅ *PTO Request Approved*\n\nApproved by <@${approver}> at ${new Date().toLocaleString()}`, 
-                blocks: [] 
-              });
-              log.info("Manager message updated with approval");
-              
-              // Notify HR if different from approver
-              const hrId = process.env.HR_SLACK_ID;
-              if (hrId && hrId !== approver) {
-                await app.client.chat.postMessage({
-                  channel: hrId,
-                  text: `✅ *PTO Approved*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end} (${daysApproved} days)\n*Approved by:* <@${approver}>\n*Time:* ${new Date().toLocaleString()}\n\n_Employee's balance has been updated automatically._`
-                });
-                log.info("HR notified of approval", { hrId });
-              }
-            } catch (error) {
-              log.error("Error processing approval", {
-                error: error.message,
-                stack: error.stack
-              });
-              
-              await app.client.chat.postMessage({
-                channel: approver,
-                text: "⚠️ The approval was processed but there was an error updating the records. Please contact IT support."
-              });
-            }
-            
-            res.statusCode = 200;
-            res.end("");
-            return;
-            
-          } else if (actionId === "deny") {
-            const { user, start, end } = actionValue;
-            const denier = payload.user.id;
-            
-            log.info("PTO denial action received", {
-              denier,
-              denierName: payload.user.name,
-              user
-            });
-            
-            try {
-              // Update the request status in Google Sheets
-              await updateRequestStatus(user, start, end, "denied");
-              log.info("Request status updated to denied in Sheets", { user });
-              
-              // Notify the employee
-              await app.client.chat.postMessage({ 
-                channel: user, 
-                text: `❌ *Your PTO request has been denied*\n\n*Requested dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n\nPlease speak with your manager if you have questions about this decision.` 
-              });
-              log.info("Denial notification sent to user", { user });
-              
-              // Update the manager's message
-              await app.client.chat.update({ 
-                channel: payload.channel.id, 
-                ts: payload.message.ts, 
-                text: `❌ *PTO Request Denied*\n\nDenied by <@${denier}> at ${new Date().toLocaleString()}`, 
-                blocks: [] 
-              });
-              log.info("Manager message updated with denial");
-              
-              // Notify HR if different from denier
-              const hrId = process.env.HR_SLACK_ID;
-              if (hrId && hrId !== denier) {
-                await app.client.chat.postMessage({
-                  channel: hrId,
-                  text: `❌ *PTO Denied*\n\n*Employee:* <@${user}>\n*Dates:* ${start} to ${end}\n*Denied by:* <@${denier}>\n*Time:* ${new Date().toLocaleString()}`
-                });
-                log.info("HR notified of denial", { hrId });
-              }
-            } catch (error) {
-              log.error("Error processing denial", {
-                error: error.message,
-                stack: error.stack
-              });
-              
-              await app.client.chat.postMessage({
-                channel: denier,
-                text: "⚠️ The denial was processed but there was an error updating the records. Please contact IT support."
-              });
-            }
-            
-            res.statusCode = 200;
-            res.end("");
-            return;
-          }
-        }
-        
-        // Return 200 for any other interactive payloads
-        res.statusCode = 200;
-        res.end("");
-        return;
-      }
-      
-      // Handle slash commands
-      if (body.command === "/pto" || body.command === "/pto-report") {
-        log.info(`Processing ${body.command} command directly`);
-        
-        if (body.command === "/pto-report") {
-          // Handle report command
-          const userId = body.user_id;
-          const queryText = body.text || "my balance";
-          
-          log.info("PTO report command received", {
-            userId,
-            userName: body.user_name,
-            queryText
+        if (eventName) {
+          // Emit the event to the app
+          await app.processEvent({
+            type: "interactive",
+            body: payload,
+            ack: async () => {},
+            client: app.client
           });
-          
-          try {
-            // Parse the report query
-            const query = await parseReportQuery(queryText);
-            log.info("Report query parsed", { userId, query });
-            
-            // Generate the report
-            const report = await generateReport(userId, query.type, query);
-            
-            if (!report.success) {
-              await app.client.chat.postMessage({
-                channel: userId,
-                text: report.message
-              });
-              res.statusCode = 200;
-              res.end("");
-              return;
-            }
-            
-            // Format the report
-            const formattedReport = await formatReportWithLLM(
-              report.reportData,
-              query.format || 'simple'
-            );
-            
-            // Send the report
-            await app.client.chat.postMessage({
-              channel: userId,
-              text: formattedReport
-            });
-            
-            log.info("Report sent successfully", {
-              userId,
-              reportType: query.type,
-              accessLevel: report.access
-            });
-            
-          } catch (error) {
-            log.error("Error processing report command", {
-              userId,
-              queryText,
-              error: error.message,
-              stack: error.stack
-            });
-            
-            await app.client.chat.postMessage({
-              channel: userId,
-              text: "❌ Sorry, there was an error generating your report. Please try again."
-            });
-          }
-          
-          res.statusCode = 200;
-          res.end("");
-          return;
         }
-        
-        // Original /pto command handling
-        if (body.command === "/pto") {
-          log.info("Executing PTO handler directly");
-          const userId = body.user_id;
-          const commandText = body.text;
-          
-          log.info("PTO command received (direct)", {
-            userId,
-            userName: body.user_name,
-            commandText,
-            channelId: body.channel_id,
-            teamId: body.team_id
-          });
-          
-          try {
-            // Parse the PTO request
-            const parsed = await parsePto(commandText);
-            log.info("PTO text parsed successfully", { userId, parsed });
-            
-            // Check if dates seem reasonable
-            const requestStartDate = new Date(parsed.start);
-            const requestEndDate = new Date(parsed.end);
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            
-            if (requestStartDate < today) {
-              log.warn("Start date is in the past", { start: parsed.start });
-              await app.client.chat.postMessage({
-                channel: userId,
-                text: `⚠️ The start date (${parsed.start}) appears to be in the past. Please submit a new request with future dates.\n\nExample: \`/pto next Monday to Friday for vacation\``
-              });
-              res.statusCode = 200;
-              res.end("");
-              return;
-            }
-            
-            // Get user info from Teams sheet
-            const userInfo = await getUserInfo(userId);
-            if (!userInfo) {
-              log.error("User not found in Teams sheet", { userId });
-              await app.client.chat.postMessage({
-                channel: userId,
-                text: "❌ Sorry, I couldn't find your information in the system. Please contact HR to be added to the Teams sheet."
-              });
-              res.statusCode = 200;
-              res.end("");
-              return;
-            }
-            
-            // Get user's balance
-            const bal = await getBalance(userId);
-            log.info("User balance retrieved", { userId, balance: bal });
-            
-            // Check if user has sufficient balance
-            if (bal.remaining <= 0) {
-              log.warn("User has insufficient PTO balance", { userId, balance: bal });
-              
-              await app.client.chat.postMessage({
-                channel: userId,
-                text: `❌ Sorry, you don't have enough PTO balance.\n\n*Your balance:*\n• Annual allowance: ${bal.allowance} days\n• Already taken: ${bal.taken} days\n• Remaining: ${bal.remaining} days`
-              });
-              res.statusCode = 200;
-              res.end("");
-              return;
-            }
-            
-            // Calculate days requested
-            const daysRequested = Math.ceil((requestEndDate - requestStartDate) / (1000 * 60 * 60 * 24)) + 1;
-            
-            if (daysRequested > bal.remaining) {
-              log.warn("User requesting more days than available", { 
-                userId, 
-                daysRequested, 
-                remaining: bal.remaining 
-              });
-              
-              await app.client.chat.postMessage({
-                channel: userId,
-                text: `❌ You're requesting ${daysRequested} days but only have ${bal.remaining} days remaining.\n\n*Your balance:*\n• Annual allowance: ${bal.allowance} days\n• Already taken: ${bal.taken} days\n• Remaining: ${bal.remaining} days`
-              });
-              res.statusCode = 200;
-              res.end("");
-              return;
-            }
-            
-            // Log the request to Google Sheets
-            await logRequest({ 
-              user: userId, 
-              start: parsed.start, 
-              end: parsed.end, 
-              reason: parsed.reason, 
-              manager: userInfo.managerId 
-            });
-            log.info("Request logged to sheets successfully", { userId });
-            
-            // Send confirmation to the requester
-            await app.client.chat.postMessage({
-              channel: userId,
-              text: `✅ *PTO Request Submitted!*\n\n*Details:*\n• Dates: ${parsed.start} to ${parsed.end} (${daysRequested} days)\n• Reason: ${parsed.reason}\n• Team: ${userInfo.team}\n• Manager: <@${userInfo.managerId}>\n\n*Your balance after approval:*\n• Current remaining: ${bal.remaining} days\n• After this request: ${bal.remaining - daysRequested} days\n\nYour request has been sent to your manager for approval. You'll be notified once they take action.`
-            });
-            log.info("Confirmation message sent to requester", { userId });
-            
-            // Send approval request to manager
-            // First, try to open a conversation with the manager
-            let managerChannel;
-            try {
-              const conversation = await app.client.conversations.open({
-                users: userInfo.managerId
-              });
-              managerChannel = conversation.channel.id;
-              log.info("Opened DM channel with manager", { 
-                managerId: userInfo.managerId, 
-                channelId: managerChannel 
-              });
-            } catch (error) {
-              log.error("Failed to open DM with manager", {
-                managerId: userInfo.managerId,
-                error: error.message
-              });
-              
-              // Notify the requester of the issue
-              await app.client.chat.postMessage({
-                channel: userId,
-                text: `⚠️ I couldn't send the approval request to your manager (<@${userInfo.managerId}>). Please contact them directly or notify IT support.\n\nManager ID: ${userInfo.managerId}`
-              });
-              
-              // Try to notify HR as backup
-              const hrId = process.env.HR_SLACK_ID;
-              if (hrId) {
-                try {
-                  const hrConversation = await app.client.conversations.open({
-                    users: hrId
-                  });
-                  await app.client.chat.postMessage({
-                    channel: hrConversation.channel.id,
-                    text: `⚠️ *Manager Unreachable - Manual Approval Needed*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Manager:* <@${userInfo.managerId}>\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\nCouldn't send to manager's DM. Please handle manually.`
-                  });
-                  log.info("HR notified as backup for unreachable manager");
-                } catch (hrError) {
-                  log.error("Failed to notify HR as backup", { error: hrError.message });
-                }
-              }
-              
-              res.statusCode = 200;
-              res.end("");
-              return;
-            }
-            
-            const managerMessage = {
-              channel: managerChannel,
-              text: `📋 *New PTO Request*`,
-              blocks: [
-                { 
-                  type: "section",
-                  text: { 
-                    type: "mrkdwn", 
-                    text: `📋 *New PTO Request*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Team:* ${userInfo.team}\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\n*Employee's Balance:*\n• Current remaining: ${bal.remaining} days\n• After approval: ${bal.remaining - daysRequested} days` 
-                  } 
-                },
-                {
-                  type: "actions",
-                  elements: [
-                    { 
-                      type: "button", 
-                      style: "primary", 
-                      text: { type: "plain_text", text: "✅ Approve" },
-                      value: JSON.stringify({ user: userId, start: parsed.start, end: parsed.end }), 
-                      action_id: "approve" 
-                    },
-                    { 
-                      type: "button", 
-                      style: "danger", 
-                      text: { type: "plain_text", text: "❌ Deny" },
-                      value: JSON.stringify({ user: userId, start: parsed.start, end: parsed.end }), 
-                      action_id: "deny" 
-                    }
-                  ]
-                }
-              ]
-            };
-            
-            await app.client.chat.postMessage(managerMessage);
-            log.info("Approval request sent to manager", { 
-              userId, 
-              managerId: userInfo.managerId,
-              managerChannel 
-            });
-            
-            // Also notify HR for visibility (optional)
-            const hrId = process.env.HR_SLACK_ID;
-            if (hrId && hrId !== userInfo.managerId) {
-              try {
-                const hrConversation = await app.client.conversations.open({
-                  users: hrId
-                });
-                await app.client.chat.postMessage({
-                  channel: hrConversation.channel.id,
-                  text: `📊 *FYI - New PTO Request*\n\n*Employee:* ${userInfo.name} (<@${userId}>)\n*Team:* ${userInfo.team}\n*Manager:* <@${userInfo.managerId}>\n*Dates:* ${parsed.start} to ${parsed.end} (${daysRequested} days)\n*Reason:* ${parsed.reason}\n\n_Manager has been notified for approval._`
-                });
-                log.info("HR notified of PTO request", { hrId });
-              } catch (hrError) {
-                log.warn("Failed to notify HR", { error: hrError.message });
-              }
-            }
-            
-          } catch (error) {
-            log.error("Error processing PTO command", {
-              userId,
-              commandText,
-              error: error.message,
-              stack: error.stack
-            });
-            
-            await app.client.chat.postMessage({
-              channel: userId,
-              text: "❌ Sorry, there was an error processing your request. Please try again or contact IT support."
-            });
-          }
-        }
-        
-        // Return immediate 200 OK to Slack
-        res.statusCode = 200;
-        res.end("");
-        return;
       }
     } else if (contentType.includes("application/json")) {
       body = JSON.parse(rawBody);
-      log.debug("Parsed JSON body", { type: body.type });
       
-      // Handle event callbacks (messages)
+      // Handle events (messages)
       if (body.type === "event_callback") {
-        log.info("Processing event callback", {
-          eventType: body.event?.type,
-          eventSubtype: body.event?.subtype,
-          userId: body.event?.user,
-          text: body.event?.text
+        await app.processEvent({
+          ...body.event,
+          client: app.client
         });
-        
-        // Handle message events (for "yes" confirmation if needed)
-        if (body.event?.type === "message" && !body.event?.subtype) {
-          const message = body.event;
-          log.debug("Message event received", {
-            user: message.user,
-            text: message.text,
-            channel: message.channel
-          });
-        }
-        
-        res.statusCode = 200;
-        res.end("");
-        return;
       }
     }
-    
-    // For any unhandled request types
-    log.warn("Unhandled request type", {
-      contentType,
-      bodyType: body?.type,
-      command: body?.command
-    });
     
     res.statusCode = 200;
     res.end("");
@@ -1713,9 +684,7 @@ export default async function handler(req, res) {
       stack: error.stack
     });
     
-    if (!res.headersSent) {
-      res.statusCode = 500;
-      res.end("Internal server error");
-    }
+    res.statusCode = 500;
+    res.end("Internal server error");
   }
 }
