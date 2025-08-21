@@ -1262,6 +1262,7 @@ export default async function handler(req, res) {
                 channel: denier,
                 text: "⚠️ The denial was processed but there was an error updating the records. Please contact IT support."
               });
+            }
             
             res.statusCode = 200;
             res.end("");
@@ -1347,18 +1348,6 @@ export default async function handler(req, res) {
         
         // Original /pto command handling
         if (body.command === "/pto") {
-          log.info("Executing PTO handler directly");
-          const userId = body.user_id;
-          const commandText = body.text;
-        
-        // Get the registered command handler
-        const commandHandlers = app._listeners?.slash_command || [];
-        const ptoHandler = commandHandlers.find(h => h.commandName === "/pto");
-        
-        if (ptoHandler) {
-          log.info("Found PTO handler, executing");
-          await ptoHandler.listener(context);
-        } else {
           log.info("Executing PTO handler directly");
           const userId = body.user_id;
           const commandText = body.text;
