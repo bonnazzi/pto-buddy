@@ -294,13 +294,7 @@ function getManagerId(userId) {
 // --- Main Slack Event Handlers ---
 
 // Handle DM messages to the bot
-app.message(async ({ message, client, say }) => {
-  // Only respond to DMs, not channel messages
-  if (message.channel_type !== 'im') return;
-  
-  // Don't respond to bot messages
-  if (message.bot_id) return;
-  
+async function handleDirectMessage({ message, client, say }) {
   const userId = message.user;
   const text = message.text;
   
@@ -379,10 +373,10 @@ app.message(async ({ message, client, say }) => {
     log.error("Error processing PTO request", { error: error.message });
     await say(`❌ Sorry, I couldn't understand your request. Please try again with a format like:\n"I need next Monday to Friday off for vacation"`);
   }
-});
+}
 
 // Handle PTO confirmation
-app.action("confirm_pto", async ({ ack, body, client }) => {
+async function handleConfirmPTO({ ack, body, client }) {
   await ack();
   
   const requestData = JSON.parse(body.actions[0].value);
@@ -480,10 +474,10 @@ app.action("confirm_pto", async ({ ack, body, client }) => {
       text: "❌ Sorry, there was an error submitting your request. Please try again."
     });
   }
-});
+}
 
 // Handle PTO cancellation
-app.action("cancel_pto", async ({ ack, body, client }) => {
+async function handleCancelPTO({ ack, body, client }) {
   await ack();
   
   await client.chat.update({
@@ -492,10 +486,10 @@ app.action("cancel_pto", async ({ ack, body, client }) => {
     text: "❌ PTO request cancelled.",
     blocks: []
   });
-});
+}
 
 // Handle PTO approval
-app.action("approve_pto", async ({ ack, body, client }) => {
+async function handleApprovePTO({ ack, body, client }) {
   await ack();
   
   const requestData = JSON.parse(body.actions[0].value);
@@ -541,10 +535,10 @@ app.action("approve_pto", async ({ ack, body, client }) => {
       text: "❌ There was an error processing the approval. Please check the Google Sheet directly."
     });
   }
-});
+}
 
 // Handle PTO denial
-app.action("deny_pto", async ({ ack, body, client }) => {
+async function handleDenyPTO({ ack, body, client }) {
   await ack();
   
   const requestData = JSON.parse(body.actions[0].value);
@@ -589,7 +583,22 @@ app.action("deny_pto", async ({ ack, body, client }) => {
       text: "❌ There was an error processing the denial. Please check the Google Sheet directly."
     });
   }
-});
+}
+
+// These app.message and app.action handlers are for local development/testing
+// In production on Vercel, the handler function routes directly to the handler functions
+if (process.env.NODE_ENV !== 'production') {
+  app.message(async ({ message, client, say }) => {
+    if (message.channel_type === 'im' && !message.bot_id) {
+      await handleDirectMessage({ message, client, say });
+    }
+  });
+  
+  app.action("confirm_pto", handleConfirmPTO);
+  app.action("cancel_pto", handleCancelPTO);
+  app.action("approve_pto", handleApprovePTO);
+  app.action("deny_pto", handleDenyPTO);
+}
 
 // --- Vercel Handler ---
 export default async function handler(req, res) {
@@ -651,27 +660,63 @@ export default async function handler(req, res) {
       // Handle interactive payloads (button clicks)
       if (body.payload) {
         const payload = JSON.parse(body.payload);
-        const eventName = payload.actions?.[0]?.action_id;
+        log.info("Interactive payload received", { 
+          type: payload.type,
+          action: payload.actions?.[0]?.action_id 
+        });
         
-        if (eventName) {
-          // Emit the event to the app
-          await app.processEvent({
-            type: "interactive",
+        // Find and execute the appropriate action handler
+        const actionId = payload.actions?.[0]?.action_id;
+        if (actionId) {
+          const mockAck = async () => { 
+            log.debug("Ack called for action", { actionId });
+          };
+          
+          const actionPayload = {
+            ack: mockAck,
             body: payload,
-            ack: async () => {},
             client: app.client
-          });
+          };
+          
+          // Route to the appropriate handler
+          if (actionId === "confirm_pto") {
+            await handleConfirmPTO(actionPayload);
+          } else if (actionId === "cancel_pto") {
+            await handleCancelPTO(actionPayload);
+          } else if (actionId === "approve_pto") {
+            await handleApprovePTO(actionPayload);
+          } else if (actionId === "deny_pto") {
+            await handleDenyPTO(actionPayload);
+          }
         }
       }
     } else if (contentType.includes("application/json")) {
       body = JSON.parse(rawBody);
+      log.debug("JSON payload received", { type: body.type });
       
       // Handle events (messages)
       if (body.type === "event_callback") {
-        await app.processEvent({
-          ...body.event,
-          client: app.client
+        const event = body.event;
+        log.info("Event callback received", { 
+          eventType: event.type,
+          user: event.user,
+          channel: event.channel,
+          text: event.text
         });
+        
+        // Handle message events
+        if (event.type === "message" && !event.bot_id && event.channel_type === "im") {
+          await handleDirectMessage({
+            message: event,
+            client: app.client,
+            say: async (text) => {
+              return await app.client.chat.postMessage({
+                channel: event.channel,
+                ...((typeof text === 'string') ? { text } : text)
+              });
+            }
+          });
+        }
       }
     }
     
