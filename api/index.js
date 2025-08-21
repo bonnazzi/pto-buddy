@@ -273,29 +273,43 @@ async function generateReport(userId, reportType, params = {}) {
   switch (reportType) {
     case 'balance':
       if (access.level === 'all') {
-        // Admin: get all balances
+        // Admin: get all balances - optimized version
         const allUsers = await getAllUsers();
-        const balances = await Promise.all(
-          allUsers.map(async (u) => ({
-            ...u,
-            balance: await getBalance(u.userId)
-          }))
-        );
+        // Filter out invalid users
+        const validUsers = allUsers.filter(u => u.userId && u.userId !== "#N/A");
+        
+        // Get all balances in one batch call
+        const userIds = validUsers.map(u => u.userId);
+        const allBalances = await getAllBalances(userIds);
+        
+        // Combine user info with balances
+        const balances = validUsers.map(u => ({
+          ...u,
+          balance: allBalances[u.userId] || { allowance: 0, taken: 0, remaining: 0 }
+        }));
+        
         reportData = { type: 'all_balances', data: balances };
       } else if (access.level === 'team') {
-        // Manager: get team balances
+        // Manager: get team balances - optimized version
         const teamMembers = await getTeamMembers(userId);
-        const balances = await Promise.all(
-          teamMembers.map(async (u) => ({
-            ...u,
-            balance: await getBalance(u.userId)
-          }))
-        );
+        const validMembers = teamMembers.filter(u => u.userId && u.userId !== "#N/A");
+        
+        // Get all team balances in one batch call
+        const teamIds = [userId, ...validMembers.map(m => m.userId)];
+        const teamBalances = await getAllBalances(teamIds);
+        
+        // Combine user info with balances
+        const balances = validMembers.map(u => ({
+          ...u,
+          balance: teamBalances[u.userId] || { allowance: 0, taken: 0, remaining: 0 }
+        }));
+        
         // Include manager's own balance
         balances.unshift({
           ...userInfo,
-          balance: await getBalance(userId)
+          balance: teamBalances[userId] || { allowance: 0, taken: 0, remaining: 0 }
         });
+        
         reportData = { type: 'team_balances', data: balances };
       } else {
         // Employee: get own balance
@@ -387,11 +401,30 @@ async function getAllUsers() {
 async function parseReportQuery(text) {
   log.info("Parsing report query with OpenRouter", { inputText: text });
   
+  // Check for explicit personal indicators first
+  const personalIndicators = ['my', 'mine', 'me', 'self', 'personal', 'i have', "i've"];
+  const teamIndicators = ['team', 'direct reports', 'my team', 'my reports'];
+  const allIndicators = ['all', 'everyone', 'company', 'entire', 'whole'];
+  
+  const lowerText = text.toLowerCase();
+  
+  // Determine scope based on explicit indicators
+  let inferredScope = 'self'; // Default to self
+  if (personalIndicators.some(indicator => lowerText.includes(indicator))) {
+    inferredScope = 'self';
+  } else if (allIndicators.some(indicator => lowerText.includes(indicator))) {
+    inferredScope = 'all';
+  } else if (teamIndicators.some(indicator => lowerText.includes(indicator))) {
+    inferredScope = 'team';
+  }
+  
   const prompt = `Extract report request info from: "${text}". 
 Identify the report type and parameters.
 Types: balance, requests, upcoming, summary
 Scope: self, team, all
 Status: pending, approved, denied, all
+
+IMPORTANT: The default scope should be "${inferredScope}" based on the query.
 
 Return JSON like:
 {
@@ -404,10 +437,11 @@ Return JSON like:
 
 Examples:
 "my balance" -> {"type":"balance","scope":"self"}
+"balance" -> {"type":"balance","scope":"self"}
+"" (empty) -> {"type":"balance","scope":"self"}
 "team requests" -> {"type":"requests","scope":"team","status":"all"}
-"pending approvals" -> {"type":"requests","scope":"team","status":"pending"}
-"who's out next week" -> {"type":"upcoming","scope":"team","days":7}
-"all employee balances" -> {"type":"balance","scope":"all"}`;
+"all employee balances" -> {"type":"balance","scope":"all"}
+"show me everyone's balance" -> {"type":"balance","scope":"all"}`;
   
   const requestBody = {
     model: "openai/gpt-3.5-turbo",
@@ -427,14 +461,24 @@ Examples:
     const data = await res.json();
     const parsed = JSON.parse(data.choices[0].message.content.trim());
     
-    log.info("Report query parsed successfully", { parsed });
+    // Override with our inferred scope if not explicitly set differently
+    if (!text.toLowerCase().includes('all') && !text.toLowerCase().includes('everyone') && 
+        !text.toLowerCase().includes('team') && !text.toLowerCase().includes('reports')) {
+      parsed.scope = 'self';
+    }
+    
+    log.info("Report query parsed successfully", { 
+      inputText: text,
+      inferredScope,
+      parsed 
+    });
     return parsed;
   } catch (error) {
     log.error("Failed to parse report query", { error: error.message });
-    // Default fallback
+    // Default fallback - always default to personal/self scope
     return {
       type: 'balance',
-      scope: 'self',
+      scope: 'self',  // Changed from 'self' to ensure personal by default
       status: 'all',
       format: 'simple'
     };
@@ -531,6 +575,12 @@ function formatReportFallback(reportData) {
 }
 
 async function getBalance(userId) {
+  // Skip invalid user IDs
+  if (!userId || userId === "#N/A" || userId.trim() === "") {
+    log.debug("Skipping invalid userId", { userId });
+    return { allowance: 0, taken: 0, remaining: 0 };
+  }
+  
   log.info("Getting balance from Google Sheets", { userId, spreadsheetId });
   
   try {
@@ -554,7 +604,7 @@ async function getBalance(userId) {
     const row = result.data.values?.find(r => r[0] === userId);
     
     if (!row) {
-      log.warn("User not found in balance sheet", { userId });
+      log.debug("User not found in balance sheet, returning default", { userId });
       return { allowance: 0, taken: 0, remaining: 0 };
     }
     
@@ -569,6 +619,53 @@ async function getBalance(userId) {
       error: error.message,
       stack: error.stack
     });
+    throw error;
+  }
+}
+
+// New optimized function to get all balances at once
+async function getAllBalances(userIds) {
+  log.info("Getting all balances in batch", { userCount: userIds.length });
+  
+  try {
+    const client = await auth.getClient();
+    const result = await sheets.spreadsheets.values.get({
+      auth: client,
+      spreadsheetId,
+      range: "Balances!A2:C1000"
+    });
+    
+    const balanceMap = {};
+    const rows = result.data.values || [];
+    
+    // Create a map for quick lookup
+    rows.forEach(row => {
+      if (row[0]) {
+        const [userId, allowance, taken] = row;
+        balanceMap[userId] = {
+          allowance: Number(allowance) || 0,
+          taken: Number(taken) || 0,
+          remaining: (Number(allowance) || 0) - (Number(taken) || 0)
+        };
+      }
+    });
+    
+    // Return balances for requested users
+    const balances = {};
+    userIds.forEach(userId => {
+      if (userId && userId !== "#N/A") {
+        balances[userId] = balanceMap[userId] || { allowance: 0, taken: 0, remaining: 0 };
+      }
+    });
+    
+    log.info("Batch balance retrieval complete", { 
+      requestedCount: userIds.length,
+      foundCount: Object.keys(balanceMap).length 
+    });
+    
+    return balances;
+  } catch (error) {
+    log.error("Failed to get batch balances", { error: error.message });
     throw error;
   }
 }
